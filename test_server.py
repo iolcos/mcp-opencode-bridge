@@ -1,6 +1,6 @@
+import asyncio
 import json
 import os
-import shlex
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,15 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 import server
 from server import (
-    build_opencode_command,
-    extract_event_error,
-    extract_event_text,
-    extract_exit_marker_code,
     extract_orca_terminal_handle,
-    get_step_finish_reason,
-    make_exit_marker_prefix,
     parse_json_output,
-    parse_opencode_event,
 )
 
 
@@ -100,145 +93,6 @@ class ExtractOrcaTerminalHandleTests(unittest.TestCase):
     def test_non_dict_result_does_not_crash(self):
         with self.assertRaises(RuntimeError):
             extract_orca_terminal_handle({"result": "not-a-dict"})
-
-
-class BuildOpencodeCommandTests(unittest.TestCase):
-    def test_without_session_id(self):
-        command = build_opencode_command(
-            agent="reviewer", prompt="hello world", exit_marker_token="tok1"
-        )
-        self.assertTrue(
-            command.startswith(
-                "opencode run --agent reviewer --format json 'hello world'"
-            )
-        )
-
-    def test_with_session_id(self):
-        command = build_opencode_command(
-            agent="implementer",
-            prompt="do the thing",
-            exit_marker_token="tok2",
-            session_id="ses_123",
-        )
-        self.assertTrue(
-            command.startswith(
-                "opencode run --agent implementer --format json --session ses_123 'do the thing'"
-            )
-        )
-
-    def test_prompt_is_shell_escaped(self):
-        command = build_opencode_command(
-            agent="reviewer", prompt="it's a test", exit_marker_token="tok3"
-        )
-        self.assertIn("'it'\"'\"'s a test'", command)
-
-    def test_appends_exit_marker_suffix(self):
-        command = build_opencode_command(
-            agent="reviewer", prompt="hi", exit_marker_token="abc123"
-        )
-        self.assertIn("ORCA_BRIDGE_EXIT_abc123:", command)
-        self.assertIn('"$?"', command)
-
-    def test_session_id_with_shell_metacharacters_is_escaped(self):
-        malicious = "ses_1; rm -rf /; $(whoami)"
-        command = build_opencode_command(
-            agent="reviewer",
-            prompt="hi",
-            exit_marker_token="tok",
-            session_id=malicious,
-        )
-        # shlex.join must quote the whole token as one shell word.
-        self.assertIn(shlex.quote(malicious), command)
-
-
-class ExtractExitMarkerCodeTests(unittest.TestCase):
-    def test_matches_exit_code(self):
-        prefix = make_exit_marker_prefix("tok")
-        self.assertEqual(extract_exit_marker_code(f"{prefix}0", prefix), "0")
-
-    def test_matches_nonzero_exit_code_with_surrounding_text(self):
-        prefix = make_exit_marker_prefix("tok")
-        self.assertEqual(
-            extract_exit_marker_code(f"noise {prefix}127 trailing", prefix), "127"
-        )
-
-    def test_no_match_returns_none(self):
-        prefix = make_exit_marker_prefix("tok")
-        self.assertIsNone(extract_exit_marker_code("nothing here", prefix))
-
-    def test_different_tokens_do_not_cross_match(self):
-        # A marker for a different run's token (or arbitrary file content
-        # containing another run's marker) must not match this run's.
-        other_run_prefix = make_exit_marker_prefix("other-token")
-        this_run_prefix = make_exit_marker_prefix("this-token")
-        self.assertIsNone(
-            extract_exit_marker_code(f"{other_run_prefix}0", this_run_prefix)
-        )
-
-
-class ParseOpencodeEventTests(unittest.TestCase):
-    def test_valid_event(self):
-        self.assertEqual(parse_opencode_event('{"type": "text"}'), {"type": "text"})
-
-    def test_invalid_json_returns_none(self):
-        self.assertIsNone(parse_opencode_event("not json"))
-
-    def test_non_dict_json_returns_none(self):
-        self.assertIsNone(parse_opencode_event("[1, 2, 3]"))
-
-
-class ExtractEventTextTests(unittest.TestCase):
-    def test_extracts_text(self):
-        event = {"type": "text", "part": {"text": "hello"}}
-        self.assertEqual(extract_event_text(event), "hello")
-
-    def test_wrong_type_returns_none(self):
-        event = {"type": "step_finish", "part": {"text": "hello"}}
-        self.assertIsNone(extract_event_text(event))
-
-    def test_missing_part_returns_none(self):
-        self.assertIsNone(extract_event_text({"type": "text"}))
-
-    def test_empty_text_returns_none(self):
-        event = {"type": "text", "part": {"text": ""}}
-        self.assertIsNone(extract_event_text(event))
-
-
-class GetStepFinishReasonTests(unittest.TestCase):
-    def test_stop_reason(self):
-        event = {"type": "step_finish", "part": {"reason": "stop"}}
-        self.assertEqual(get_step_finish_reason(event), "stop")
-
-    def test_length_reason_is_terminal(self):
-        event = {"type": "step_finish", "part": {"reason": "length"}}
-        self.assertEqual(get_step_finish_reason(event), "length")
-
-    def test_tool_calls_reason_is_not_terminal(self):
-        # A tool-calls step_finish means more steps follow (after the tool
-        # runs); the loop must keep polling, not return early.
-        event = {"type": "step_finish", "part": {"reason": "tool-calls"}}
-        self.assertIsNone(get_step_finish_reason(event))
-
-    def test_wrong_type_returns_none(self):
-        event = {"type": "text", "part": {"reason": "stop"}}
-        self.assertIsNone(get_step_finish_reason(event))
-
-    def test_missing_part_returns_none(self):
-        self.assertIsNone(get_step_finish_reason({"type": "step_finish"}))
-
-
-class ExtractEventErrorTests(unittest.TestCase):
-    def test_string_error(self):
-        event = {"type": "error", "error": "boom"}
-        self.assertEqual(extract_event_error(event), "boom")
-
-    def test_dict_error(self):
-        event = {"type": "error", "error": {"message": "boom"}}
-        self.assertIn("boom", extract_event_error(event))
-
-    def test_non_error_type_returns_none(self):
-        event = {"type": "text", "error": "boom"}
-        self.assertIsNone(extract_event_error(event))
 
 
 class LoadBrowserConfigTests(unittest.TestCase):
@@ -338,423 +192,313 @@ class RunCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("timed out", str(ctx.exception).lower())
 
 
-class ReadOrcaTerminalTests(unittest.IsolatedAsyncioTestCase):
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_nonzero_returncode_raises(self, mock_run_command):
-        mock_run_command.return_value = (1, "", "boom")
+# ---------------------------------------------------------------------------
+# OpenCode HTTP data channel.
+# ---------------------------------------------------------------------------
 
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.read_orca_terminal("term_x")
+
+class FakeResponse:
+    def __init__(self, status_code: int = 200, json_data=None, text: str | None = None):
+        self.status_code = status_code
+        self._json_data = {} if json_data is None else json_data
+        self.text = text if text is not None else json.dumps(self._json_data)
+        self.is_error = status_code >= 400
+
+    def json(self):
+        return self._json_data
+
+
+def make_mock_client(response: FakeResponse) -> AsyncMock:
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.post = AsyncMock(return_value=response)
+    return mock_client
+
+
+class CreateOpencodeSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_posts_and_returns_session_id(self):
+        mock_client = make_mock_client(FakeResponse(json_data={"id": "ses_123"}))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            session_id = await server.create_opencode_session("http://127.0.0.1:4096", title="t")
+
+        self.assertEqual(session_id, "ses_123")
+        mock_client.post.assert_awaited_once_with(
+            "http://127.0.0.1:4096/session", json={"title": "t"}
+        )
+
+    async def test_error_status_raises(self):
+        mock_client = make_mock_client(FakeResponse(status_code=400, text="bad request"))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            with self.assertRaises(RuntimeError) as ctx:
+                await server.create_opencode_session("http://x", title="t")
+
+        self.assertIn("bad request", str(ctx.exception))
+
+    async def test_missing_id_raises(self):
+        mock_client = make_mock_client(FakeResponse(json_data={}))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            with self.assertRaises(RuntimeError):
+                await server.create_opencode_session("http://x", title="t")
+
+
+class SendOpencodePromptTests(unittest.IsolatedAsyncioTestCase):
+    async def test_posts_expected_body_and_returns_json(self):
+        payload = {"info": {"finish": "stop"}, "parts": [{"type": "text", "text": "hi"}]}
+        mock_client = make_mock_client(FakeResponse(json_data=payload))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            result = await server.send_opencode_prompt(
+                "http://x", "ses_1", "reviewer", "do it", 30
+            )
+
+        self.assertEqual(result, payload)
+        mock_client.post.assert_awaited_once_with(
+            "http://x/session/ses_1/message",
+            json={"agent": "reviewer", "parts": [{"type": "text", "text": "do it"}]},
+        )
+
+    async def test_error_status_raises_with_body(self):
+        mock_client = make_mock_client(FakeResponse(status_code=500, text="boom"))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            with self.assertRaises(RuntimeError) as ctx:
+                await server.send_opencode_prompt("http://x", "ses_1", "reviewer", "do it", 30)
 
         self.assertIn("boom", str(ctx.exception))
 
+
+# ---------------------------------------------------------------------------
+# opencode serve process management.
+# ---------------------------------------------------------------------------
+
+
+class FakeStdout:
+    def __init__(self, lines=None, hang: bool = False):
+        self._lines = list(lines or [])
+        self._hang = hang
+
+    async def readline(self) -> bytes:
+        if self._hang:
+            await asyncio.sleep(3600)
+        if self._lines:
+            return self._lines.pop(0)
+        return b""
+
+
+class FakeProcess:
+    def __init__(self, lines=None, pid: int = 54321, returncode=None, hang: bool = False):
+        self.stdout = FakeStdout(lines, hang=hang)
+        self.pid = pid
+        self.returncode = returncode
+
+    async def wait(self):
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
+
+class EnsureOpencodeServerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._opencode_servers.clear()
+
+    async def test_starts_and_caches_by_project_dir(self):
+        process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
+
+        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+            base_url = await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-1"))
+
+        self.assertEqual(base_url, "http://127.0.0.1:4096")
+        self.assertIn(Path("/tmp/orca-bridge-proj-1"), server._opencode_servers)
+
+    async def test_reuses_cached_server_when_still_alive(self):
+        process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
+        mock_exec = AsyncMock(return_value=process)
+
+        with patch("server.asyncio.create_subprocess_exec", new=mock_exec):
+            await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-2"))
+            await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-2"))
+
+        mock_exec.assert_awaited_once()
+
+    async def test_respawns_when_cached_process_died(self):
+        dead_process = FakeProcess([], returncode=1)
+        alive_process = FakeProcess([b"opencode server listening on http://127.0.0.1:4097\n"])
+        server._opencode_servers[Path("/tmp/orca-bridge-proj-3")] = (
+            dead_process,
+            "http://127.0.0.1:4096",
+        )
+
+        with patch(
+            "server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=alive_process)
+        ):
+            base_url = await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-3"))
+
+        self.assertEqual(base_url, "http://127.0.0.1:4097")
+
+    @patch("server.os.killpg")
+    @patch("server.os.getpgid", return_value=1)
+    async def test_process_exits_without_listening_line_raises(self, mock_getpgid, mock_killpg):
+        process = FakeProcess([b"some startup noise\n"], returncode=1)
+
+        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+            with self.assertRaises(RuntimeError):
+                await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-4"))
+
+    @patch("server.os.killpg")
+    @patch("server.os.getpgid", return_value=1)
+    @patch("server.OPENCODE_SERVE_STARTUP_TIMEOUT_SECONDS", 0.05)
+    async def test_timeout_raises_and_kills_process(self, mock_getpgid, mock_killpg):
+        process = FakeProcess(hang=True)
+
+        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+            with self.assertRaises(asyncio.TimeoutError):
+                await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-5"))
+
+        mock_killpg.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Visibility terminal (best-effort, never allowed to break the data flow).
+# ---------------------------------------------------------------------------
+
+
+class EnsureVisibleTerminalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._session_terminals.clear()
+
     @patch("server.run_command", new_callable=AsyncMock)
-    async def test_success_returns_parsed_json(self, mock_run_command):
-        mock_run_command.return_value = (0, '{"ok": true}', "")
+    async def test_does_not_recreate_when_terminal_alive(self, mock_run_command):
+        server._session_terminals["ses_1"] = "term_existing"
+        mock_run_command.return_value = (0, "{}", "")
 
-        result = await server.read_orca_terminal("term_x")
+        await server.ensure_visible_terminal("http://x", "ses_1", "reviewer", Path("/tmp/p"))
 
-        self.assertEqual(result, {"ok": True})
+        mock_run_command.assert_awaited_once()
+        args = mock_run_command.await_args.args[0]
+        self.assertIn("show", args)
+        self.assertEqual(server._session_terminals["ses_1"], "term_existing")
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_creates_terminal_when_none_tracked(self, mock_run_command):
+        create_output = json.dumps({"result": {"terminal": {"handle": "term_new"}}})
+        mock_run_command.return_value = (0, create_output, "")
+
+        await server.ensure_visible_terminal("http://x:1", "ses_2", "implementer", Path("/tmp/p"))
+
+        self.assertEqual(server._session_terminals["ses_2"], "term_new")
+        args = mock_run_command.await_args.args[0]
+        self.assertIn("create", args)
+        self.assertIn("opencode attach http://x:1 --session ses_2", " ".join(args))
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_recreates_when_tracked_terminal_is_gone(self, mock_run_command):
+        server._session_terminals["ses_3"] = "term_stale"
+        create_output = json.dumps({"result": {"terminal": {"handle": "term_fresh"}}})
+        mock_run_command.side_effect = [
+            (1, "", "not found"),
+            (0, create_output, ""),
+        ]
+
+        await server.ensure_visible_terminal("http://x", "ses_3", "reviewer", Path("/tmp/p"))
+
+        self.assertEqual(server._session_terminals["ses_3"], "term_fresh")
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_failure_is_swallowed_never_raises(self, mock_run_command):
+        mock_run_command.side_effect = RuntimeError("orca is not running")
+
+        await server.ensure_visible_terminal("http://x", "ses_4", "reviewer", Path("/tmp/p"))
+
+        self.assertNotIn("ses_4", server._session_terminals)
 
 
-def make_terminal_read_output(tail: list[str]) -> str:
-    return json.dumps({"result": {"terminal": {"tail": tail}}})
-
-
-CREATE_TERMINAL_OUTPUT = json.dumps(
-    {"result": {"terminal": {"handle": "term_test"}}}
-)
+# ---------------------------------------------------------------------------
+# run_opencode orchestration.
+# ---------------------------------------------------------------------------
 
 
 class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_mid_run_read_failure_closes_terminal(self, mock_run_command):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (1, "", "orca read boom"),
-            (0, "{}", ""),  # the best-effort close call
-        ]
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
+    async def test_creates_new_session_when_none_given(
+        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
+    ):
+        mock_ensure_server.return_value = "http://127.0.0.1:4096"
+        mock_create_session.return_value = "ses_new"
+        mock_send_prompt.return_value = {
+            "info": {"finish": "stop"},
+            "parts": [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}],
+        }
+
+        result = await server.run_opencode(agent="reviewer", prompt="do it")
+
+        self.assertEqual(
+            result, {"session_id": "ses_new", "response": "hello world", "finish_reason": "stop"}
+        )
+        mock_create_session.assert_awaited_once()
+        mock_send_prompt.assert_awaited_once_with(
+            "http://127.0.0.1:4096", "ses_new", "reviewer", "do it",
+            server.OPENCODE_PROMPT_TIMEOUT_SECONDS,
+        )
+
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
+    async def test_reuses_given_session_id(
+        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
+    ):
+        mock_ensure_server.return_value = "http://x"
+        mock_send_prompt.return_value = {"info": {"finish": "stop"}, "parts": []}
+
+        result = await server.run_opencode(agent="reviewer", prompt="do it", session_id="ses_existing")
+
+        self.assertEqual(result["session_id"], "ses_existing")
+        mock_create_session.assert_not_awaited()
+
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
+    async def test_error_in_info_raises(
+        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
+    ):
+        mock_ensure_server.return_value = "http://x"
+        mock_create_session.return_value = "ses_1"
+        mock_send_prompt.return_value = {"info": {"error": {"message": "boom"}}, "parts": []}
 
         with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertIn("orca read boom", str(ctx.exception))
-        self.assertEqual(mock_run_command.await_count, 3)
-        close_call = mock_run_command.await_args_list[2]
-        self.assertIn("close", close_call.args[0])
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_dedups_repeated_lines_and_stops_on_finish(
-        self, mock_run_command, mock_sleep
-    ):
-        text_event = json.dumps({"type": "text", "part": {"text": "hello "}})
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (0, make_terminal_read_output([text_event]), ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        text_event,  # already seen: must not be appended again
-                        json.dumps({"type": "text", "part": {"text": "world"}}),
-                        json.dumps(
-                            {"type": "step_finish", "part": {"reason": "stop"}}
-                        ),
-                    ]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["response"], "hello world")
-        self.assertEqual(result["terminal_handle"], "term_test")
-        self.assertEqual(result["finish_reason"], "stop")
-        mock_sleep.assert_awaited_once_with(1.0)
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_tool_calls_finish_reason_does_not_end_run(
-        self, mock_run_command, mock_sleep
-    ):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [json.dumps({"type": "step_finish", "part": {"reason": "tool-calls"}})]
-                ),
-                "",
-            ),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        json.dumps({"type": "text", "part": {"text": "final answer"}}),
-                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
-                    ]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["response"], "final answer")
-        self.assertEqual(result["finish_reason"], "stop")
-        self.assertEqual(mock_run_command.await_count, 3)
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_non_stop_finish_reason_still_ends_run(
-        self, mock_run_command, mock_sleep
-    ):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [json.dumps({"type": "step_finish", "part": {"reason": "length"}})]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["finish_reason"], "length")
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_error_event_raises(self, mock_run_command, mock_sleep):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [json.dumps({"type": "error", "error": "boom"})]
-                ),
-                "",
-            ),
-            (0, "{}", ""),  # the best-effort close call
-        ]
-
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertIn("boom", str(ctx.exception))
-        self.assertEqual(mock_run_command.await_count, 3)
-        close_call = mock_run_command.await_args_list[2]
-        self.assertIn("close", close_call.args[0])
-
-    @patch("server.uuid.uuid4")
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_nonzero_exit_without_finish_event_raises(
-        self, mock_run_command, mock_sleep, mock_uuid4
-    ):
-        mock_uuid4.return_value.hex = "faketoken"
-        marker = make_exit_marker_prefix("faketoken")
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        json.dumps({"type": "text", "part": {"text": "partial"}}),
-                        "! permission requested: external_directory; auto-rejecting",
-                        f"{marker}1",
-                    ]
-                ),
-                "",
-            ),
-            (0, "{}", ""),  # the best-effort close call
-        ]
-
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertIn("exit_code=1", str(ctx.exception))
-        self.assertIn("partial", str(ctx.exception))
-        self.assertEqual(mock_run_command.await_count, 3)
-
-    @patch("server.uuid.uuid4")
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_zero_exit_without_finish_event_returns_partial_success(
-        self, mock_run_command, mock_sleep, mock_uuid4
-    ):
-        # The JSONL stream can legitimately miss the final "stop" event
-        # (bounded tail window scrolling past it), but a zero exit code
-        # from the shell itself is still a reliable success signal.
-        mock_uuid4.return_value.hex = "faketoken"
-        marker = make_exit_marker_prefix("faketoken")
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        json.dumps({"type": "text", "part": {"text": "done"}}),
-                        f"{marker}0",
-                    ]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["response"], "done")
-        self.assertEqual(result["finish_reason"], "process_exit")
-
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_timeout_raises_with_partial_response(self, mock_run_command):
-        # Second call is the best-effort terminal close triggered by the timeout.
-        mock_run_command.side_effect = [(0, CREATE_TERMINAL_OUTPUT, ""), (0, "{}", "")]
-
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi", timeout_seconds=0)
-
-        self.assertIn("Timed out", str(ctx.exception))
-        self.assertEqual(mock_run_command.await_count, 2)
-
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_timeout_closes_terminal(self, mock_run_command):
-        mock_run_command.side_effect = [(0, CREATE_TERMINAL_OUTPUT, ""), (0, "{}", "")]
-
-        with self.assertRaises(RuntimeError):
-            await server.run_opencode(agent="reviewer", prompt="hi", timeout_seconds=0)
-
-        close_call = mock_run_command.await_args_list[1]
-        self.assertIn("close", close_call.args[0])
-        self.assertIn("term_test", close_call.args[0])
-
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_timeout_close_failure_does_not_mask_original_error(
-        self, mock_run_command
-    ):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            RuntimeError("close also failed"),
-        ]
-
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi", timeout_seconds=0)
-
-        self.assertIn("Timed out", str(ctx.exception))
-
-
-class RunOpencodeAdditionalTests(unittest.IsolatedAsyncioTestCase):
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_malformed_read_payload_is_tolerated(
-        self, mock_run_command, mock_sleep
-    ):
-        # A poll that doesn't have the expected result.terminal.tail shape
-        # (e.g. "terminal": null) must not crash the loop -- it's skipped
-        # as if there were no new lines, and polling continues.
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (0, json.dumps({"result": {"terminal": None}}), ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [json.dumps({"type": "step_finish", "part": {"reason": "stop"}})]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["finish_reason"], "stop")
-
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_terminal_create_failure_raises(self, mock_run_command):
-        mock_run_command.side_effect = [(1, "", "boom")]
-
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi")
+            await server.run_opencode(agent="reviewer", prompt="do it")
 
         self.assertIn("boom", str(ctx.exception))
 
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_terminal_create_missing_handle_raises(self, mock_run_command):
-        mock_run_command.side_effect = [
-            (0, json.dumps({"result": {"terminal": {}}}), "")
-        ]
-
-        with self.assertRaises(RuntimeError):
-            await server.run_opencode(agent="reviewer", prompt="hi")
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_non_list_tail_is_ignored(self, mock_run_command, mock_sleep):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (0, json.dumps({"result": {"terminal": {"tail": "not-a-list"}}}), ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [json.dumps({"type": "step_finish", "part": {"reason": "stop"}})]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["finish_reason"], "stop")
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_session_id_detected_from_event(self, mock_run_command, mock_sleep):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        json.dumps(
-                            {
-                                "type": "text",
-                                "part": {"text": "hi"},
-                                "sessionID": "ses_abc",
-                            }
-                        ),
-                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
-                    ]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["session_id"], "ses_abc")
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_content_filter_reason_is_terminal(self, mock_run_command, mock_sleep):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        json.dumps(
-                            {"type": "step_finish", "part": {"reason": "content_filter"}}
-                        )
-                    ]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["finish_reason"], "content_filter")
-
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_dict_error_event_raises_with_json_body(
-        self, mock_run_command, mock_sleep
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
+    async def test_non_text_parts_are_ignored(
+        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
     ):
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        json.dumps(
-                            {"type": "error", "error": {"message": "boom", "code": 42}}
-                        )
-                    ]
-                ),
-                "",
-            ),
-            (0, "{}", ""),  # the best-effort close call
-        ]
+        mock_ensure_server.return_value = "http://x"
+        mock_create_session.return_value = "ses_1"
+        mock_send_prompt.return_value = {
+            "info": {"finish": "stop"},
+            "parts": [
+                {"type": "step-start"},
+                {"type": "text", "text": "kept"},
+                {"type": "tool", "text": "ignored-because-not-text-type"},
+            ],
+        }
 
-        with self.assertRaises(RuntimeError) as ctx:
-            await server.run_opencode(agent="reviewer", prompt="hi")
+        result = await server.run_opencode(agent="reviewer", prompt="do it")
 
-        self.assertIn("boom", str(ctx.exception))
-        self.assertEqual(mock_run_command.await_count, 3)
-
-    @patch("server.uuid.uuid4")
-    @patch("server.asyncio.sleep", new_callable=AsyncMock)
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_other_runs_marker_does_not_false_positive(
-        self, mock_run_command, mock_sleep, mock_uuid4
-    ):
-        # A marker matching a *different* run's token -- e.g. echoed back
-        # via a "read" tool call on a file that happens to contain it --
-        # must not be mistaken for this run's own completion signal.
-        mock_uuid4.return_value.hex = "thisrun"
-        other_marker = make_exit_marker_prefix("otherrun")
-        mock_run_command.side_effect = [
-            (0, CREATE_TERMINAL_OUTPUT, ""),
-            (
-                0,
-                make_terminal_read_output(
-                    [
-                        f"{other_marker}0",
-                        json.dumps({"type": "text", "part": {"text": "real answer"}}),
-                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
-                    ]
-                ),
-                "",
-            ),
-        ]
-
-        result = await server.run_opencode(agent="reviewer", prompt="hi")
-
-        self.assertEqual(result["response"], "real answer")
-        self.assertEqual(result["finish_reason"], "stop")
+        self.assertEqual(result["response"], "kept")
 
 
 class ToolWrapperTests(unittest.IsolatedAsyncioTestCase):
@@ -772,8 +516,6 @@ class ToolWrapperTests(unittest.IsolatedAsyncioTestCase):
         mock_run_opencode.return_value = {
             "session_id": "ses_1",
             "response": "looks good",
-            "stderr": "",
-            "terminal_handle": "term_1",
             "finish_reason": "stop",
         }
 
@@ -803,25 +545,6 @@ class ToolWrapperTests(unittest.IsolatedAsyncioTestCase):
     async def test_review_browser_raises_tool_error(self):
         with self.assertRaises(server.ToolError):
             await server.review_browser(test_plan="x", account="demo")
-
-
-class CloseOrcaTerminalTests(unittest.IsolatedAsyncioTestCase):
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_success_path_calls_orca_close(self, mock_run_command):
-        mock_run_command.return_value = (0, "{}", "")
-
-        await server.close_orca_terminal("term_x")
-
-        mock_run_command.assert_awaited_once()
-        args = mock_run_command.await_args.args[0]
-        self.assertIn("close", args)
-        self.assertIn("term_x", args)
-
-    @patch("server.run_command", new_callable=AsyncMock)
-    async def test_failure_is_swallowed(self, mock_run_command):
-        mock_run_command.side_effect = RuntimeError("orca close boom")
-
-        await server.close_orca_terminal("term_x")  # must not raise
 
 
 if __name__ == "__main__":
