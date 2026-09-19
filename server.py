@@ -168,20 +168,6 @@ def parse_json_output(output: str) -> dict[str, Any]:
     )
 
 
-def extract_orca_terminal_handle(result: dict[str, Any]) -> str:
-    inner_result = result.get("result")
-    terminal = inner_result.get("terminal") if isinstance(inner_result, dict) else None
-    handle = terminal.get("handle") if isinstance(terminal, dict) else None
-
-    if not handle:
-        raise RuntimeError(
-            "Orca did not return a terminal handle:\n"
-            f"{json.dumps(result, indent=2)}"
-        )
-
-    return str(handle)
-
-
 # ---------------------------------------------------------------------------
 # OpenCode server management.
 #
@@ -200,17 +186,31 @@ OPENCODE_PROMPT_TIMEOUT_SECONDS = 900
 
 _LISTENING_URL_RE = re.compile(r"listening on (http://\S+)")
 
-# project_dir -> (process, base_url)
-_opencode_servers: dict[Path, tuple[asyncio.subprocess.Process, str]] = {}
-_opencode_servers_lock = asyncio.Lock()
+# session_id -> (process, base_url, terminal_handle_or_None). Each session
+# gets its own dedicated opencode serve process (see _create_session_pane /
+# _session_server_env below) so its busy/idle/waiting status can be attributed
+# to its own Orca terminal instead of a shared server with no single owner.
+_session_state: dict[str, tuple[asyncio.subprocess.Process, str, str | None]] = {}
+
+# session_id -> lock, so two concurrent calls sharing a session_id don't each
+# decide "no backend yet" and spawn a duplicate server/terminal. Lazily
+# populated; safe to grow unboundedly given each entry is a bare Lock
+# (negligible memory).
+_session_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _session_locks[session_id] = lock
+    return lock
+
 
 # Keeps references to fire-and-forget background tasks (stdout drains) alive
 # for as long as the process runs -- otherwise they could be garbage
 # collected mid-flight.
 _background_tasks: set[asyncio.Task] = set()
-
-# session_id -> Orca terminal handle showing the live `opencode attach` view.
-_session_terminals: dict[str, str] = {}
 
 
 def _spawn_background_task(coro: Any) -> None:
@@ -227,9 +227,38 @@ async def _drain_stream(stream: asyncio.StreamReader) -> None:
             return
 
 
+# Connection-level failures (refused, reset, DNS, or the initial connect
+# itself timing out) mean the server is actually gone/unreachable and worth
+# restarting. Deliberately excludes ReadTimeout/WriteTimeout/PoolTimeout: a
+# long-running but still-connected prompt (up to timeout_seconds) must not
+# be torn down and retried just because it's slow.
+_TRANSIENT_SERVER_ERRORS = (httpx2.NetworkError, httpx2.ConnectTimeout)
+
+
+def _evict_and_kill_session_backend(session_id: str) -> None:
+    """Stop tracking a session's server that failed to respond, and actually
+    kill it so it doesn't leak as an untracked, unkillable orphan process."""
+    cached = _session_state.pop(session_id, None)
+
+    if cached is None:
+        return
+
+    process, _base_url, _handle = cached
+
+    if process.returncode is not None:
+        return
+
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        logger.exception("Failed to terminate unresponsive opencode serve process %s", process.pid)
+
+
 def _kill_opencode_servers() -> None:
     """Best-effort synchronous cleanup, registered with atexit."""
-    for process, _base_url in _opencode_servers.values():
+    for process, _base_url, _handle in _session_state.values():
         if process.returncode is not None:
             continue
         try:
@@ -243,7 +272,103 @@ def _kill_opencode_servers() -> None:
 atexit.register(_kill_opencode_servers)
 
 
-async def _start_opencode_server(project_dir: Path) -> tuple[asyncio.subprocess.Process, str]:
+def _install_termination_cleanup() -> None:
+    """
+    atexit alone is not enough: an MCP host commonly tears down this server's
+    process with SIGTERM (e.g. on /mcp reconnect) rather than letting the
+    interpreter exit normally, and atexit handlers do not run on a signal.
+    Chain our cleanup in front of whatever handler (default or the MCP SDK's
+    own) would otherwise run, so opencode serve is still killed either way.
+    SIGKILL cannot be handled by any process and is an accepted exception.
+    """
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        previous_handler = signal.getsignal(sig)
+
+        def handler(signum, frame, _previous=previous_handler):
+            _kill_opencode_servers()
+            if callable(_previous):
+                _previous(signum, frame)
+            elif _previous == signal.SIG_DFL:
+                signal.signal(signum, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            # SIG_IGN: leave the signal ignored, same as before.
+
+        signal.signal(sig, handler)
+
+
+_install_termination_cleanup()
+
+
+async def _create_session_pane(agent: str, project_dir: Path) -> tuple[str, str, str] | None:
+    """
+    Best-effort: create an empty Orca terminal to host this session's visible
+    `opencode attach` view, returning (handle, pane_key, tab_id). Returns None
+    (never raises) if Orca is unavailable -- a missing pane just means no
+    visible terminal and no live status, not a failed implement/review call.
+    """
+    try:
+        returncode, stdout, stderr = await run_command(
+            [
+                "orca",
+                "terminal",
+                "create",
+                "--worktree",
+                "current",
+                "--title",
+                f"OpenCode {agent}",
+                "--json",
+            ],
+            cwd=str(project_dir),
+            timeout=ORCA_COMMAND_TIMEOUT_SECONDS,
+        )
+
+        if returncode != 0:
+            raise RuntimeError(stderr or stdout)
+
+        terminal = parse_json_output(stdout).get("result")
+        terminal = terminal.get("terminal") if isinstance(terminal, dict) else None
+        handle = terminal.get("handle") if isinstance(terminal, dict) else None
+        pane_key = terminal.get("paneKey") if isinstance(terminal, dict) else None
+        tab_id = terminal.get("tabId") if isinstance(terminal, dict) else None
+
+        if not (handle and pane_key and tab_id):
+            raise RuntimeError(f"Orca did not return full pane identity:\n{stdout}")
+
+        return str(handle), str(pane_key), str(tab_id)
+    except Exception:
+        logger.exception("Failed to create a visibility pane for agent %s", agent)
+        return None
+
+
+def _session_server_env(pane: tuple[str, str, str] | None) -> dict[str, str]:
+    """
+    Env for a session's dedicated opencode serve process. The pane-identity
+    vars are always removed first. If `pane` (handle, pane_key, tab_id) is
+    given, they're re-set to point at that terminal, so opencode's Orca
+    status-hook plugin (loaded via ORCA_OPENCODE_CONFIG_DIR, left untouched)
+    attributes busy/idle/waiting status to it. Otherwise they stay stripped so
+    nothing is misattributed to whatever pane this MCP process itself
+    inherited (e.g. its own coordinator terminal).
+    """
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in ("ORCA_PANE_KEY", "ORCA_TAB_ID", "ORCA_TERMINAL_HANDLE", "ORCA_AGENT_LAUNCH_TOKEN")
+    }
+
+    if pane is not None:
+        handle, pane_key, tab_id = pane
+        env["ORCA_PANE_KEY"] = pane_key
+        env["ORCA_TAB_ID"] = tab_id
+        env["ORCA_TERMINAL_HANDLE"] = handle
+
+    return env
+
+
+async def _spawn_session_server(
+    project_dir: Path, pane: tuple[str, str, str] | None
+) -> tuple[asyncio.subprocess.Process, str]:
     process = await asyncio.create_subprocess_exec(
         "opencode",
         "serve",
@@ -252,6 +377,7 @@ async def _start_opencode_server(project_dir: Path) -> tuple[asyncio.subprocess.
         "--hostname",
         "127.0.0.1",
         cwd=str(project_dir),
+        env=_session_server_env(pane),
         stdout=asyncio.subprocess.PIPE,
         # Merged into stdout: we don't know in advance which stream carries
         # the startup banner, and only one stream needs draining afterwards.
@@ -264,6 +390,10 @@ async def _start_opencode_server(project_dir: Path) -> tuple[asyncio.subprocess.
             line = await process.stdout.readline()
 
             if not line:
+                # EOF on the pipe can arrive slightly before asyncio updates
+                # returncode; wait for it so the message reports the real
+                # exit code instead of a misleading "None".
+                await process.wait()
                 raise RuntimeError(
                     "opencode serve exited before printing a listening URL "
                     f"(exit code {process.returncode})"
@@ -291,20 +421,76 @@ async def _start_opencode_server(project_dir: Path) -> tuple[asyncio.subprocess.
     return process, base_url
 
 
-async def ensure_opencode_server(project_dir: Path) -> str:
-    """Start `opencode serve` for this project if needed, reuse it otherwise."""
-    async with _opencode_servers_lock:
-        cached = _opencode_servers.get(project_dir)
+async def _attach_terminal_to_session(handle: str, base_url: str, session_id: str) -> None:
+    """Best-effort: point the pane at the session now that both exist. Never
+    raises -- a failure here must never fail the actual implement/review call."""
+    try:
+        returncode, stdout, stderr = await run_command(
+            [
+                "orca",
+                "terminal",
+                "send",
+                "--terminal",
+                handle,
+                "--text",
+                f"opencode attach {base_url} --session {session_id}",
+                "--enter",
+                "--json",
+            ],
+            timeout=ORCA_COMMAND_TIMEOUT_SECONDS,
+        )
+
+        if returncode != 0:
+            raise RuntimeError(stderr or stdout)
+    except Exception:
+        logger.exception("Failed to attach terminal %s to session %s", handle, session_id)
+
+
+async def _create_session_backend(
+    session_id: str | None, agent: str, project_dir: Path
+) -> tuple[str, str]:
+    pane = await _create_session_pane(agent, project_dir)
+    process, base_url = await _spawn_session_server(project_dir, pane)
+
+    if session_id is None:
+        session_id = await create_opencode_session(base_url, title=f"orca-bridge {agent}")
+
+    handle = pane[0] if pane is not None else None
+    _session_state[session_id] = (process, base_url, handle)
+
+    if handle is not None:
+        await _attach_terminal_to_session(handle, base_url, session_id)
+
+    return base_url, session_id
+
+
+async def ensure_session_backend(
+    session_id: str | None, agent: str, project_dir: Path
+) -> tuple[str, str]:
+    """Reuse this session's dedicated server/terminal if both are still
+    alive; otherwise (re)create them, preserving the session_id."""
+    if session_id is None:
+        return await _create_session_backend(None, agent, project_dir)
+
+    async with _get_session_lock(session_id):
+        cached = _session_state.get(session_id)
 
         if cached is not None:
-            process, base_url = cached
-            if process.returncode is None:
-                return base_url
-            del _opencode_servers[project_dir]
+            process, base_url, handle = cached
+            server_alive = process.returncode is None
+            terminal_alive = True
 
-        process, base_url = await _start_opencode_server(project_dir)
-        _opencode_servers[project_dir] = (process, base_url)
-        return base_url
+            if server_alive and handle is not None:
+                returncode, _, _ = await run_command(
+                    ["orca", "terminal", "show", "--terminal", handle, "--json"],
+                    timeout=ORCA_COMMAND_TIMEOUT_SECONDS,
+                )
+                terminal_alive = returncode == 0
+
+            if server_alive and terminal_alive:
+                return base_url, session_id
+
+        return await _create_session_backend(session_id, agent, project_dir)
 
 
 async def create_opencode_session(base_url: str, title: str) -> str:
@@ -316,7 +502,14 @@ async def create_opencode_session(base_url: str, title: str) -> str:
             f"Failed to create OpenCode session:\n{response.text}"
         )
 
-    session_id = response.json().get("id")
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Unexpected OpenCode response (not an object):\n{response.text}"
+        )
+
+    session_id = data.get("id")
 
     if not session_id:
         raise RuntimeError(
@@ -347,58 +540,14 @@ async def send_opencode_prompt(
             f"OpenCode prompt failed (status {response.status_code}):\n{response.text}"
         )
 
-    return response.json()
+    data = response.json()
 
-
-async def ensure_visible_terminal(
-    base_url: str,
-    session_id: str,
-    agent: str,
-    project_dir: Path,
-) -> None:
-    """
-    Best-effort: open an Orca terminal running `opencode attach`, purely so
-    the session is visible/watchable in Orca. This is never read back by the
-    MCP, and a failure here must never fail the actual implement/review call.
-    """
-    try:
-        handle = _session_terminals.get(session_id)
-
-        if handle is not None:
-            returncode, _, _ = await run_command(
-                ["orca", "terminal", "show", "--terminal", handle, "--json"],
-                timeout=ORCA_COMMAND_TIMEOUT_SECONDS,
-            )
-            if returncode == 0:
-                return
-
-        returncode, stdout, stderr = await run_command(
-            [
-                "orca",
-                "terminal",
-                "create",
-                "--worktree",
-                "current",
-                "--title",
-                f"OpenCode {agent}",
-                "--command",
-                f"opencode attach {base_url} --session {session_id}",
-                "--json",
-            ],
-            cwd=str(project_dir),
-            timeout=ORCA_COMMAND_TIMEOUT_SECONDS,
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Unexpected OpenCode response (not an object):\n{response.text}"
         )
 
-        if returncode != 0:
-            raise RuntimeError(stderr or stdout)
-
-        _session_terminals[session_id] = extract_orca_terminal_handle(
-            parse_json_output(stdout)
-        )
-    except Exception:
-        logger.exception(
-            "Failed to open/verify the visibility terminal for session %s", session_id
-        )
+    return data
 
 
 async def run_opencode(
@@ -408,16 +557,35 @@ async def run_opencode(
     timeout_seconds: int = OPENCODE_PROMPT_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     project_dir = get_project_dir()
-    base_url = await ensure_opencode_server(project_dir)
+    current_session_id = session_id
 
-    if session_id is None:
-        session_id = await create_opencode_session(base_url, title=f"orca-bridge {agent}")
+    # Two attempts: if the session's backend turns out to be unreachable
+    # (alive per its exit code, but hung or otherwise not answering),
+    # invalidate it and retry once against a freshly spawned one before
+    # giving up. The (possibly newly created) session_id is preserved across
+    # the retry -- opencode session data persists independently of which
+    # server process created it, so conversation history isn't lost.
+    for attempt in range(2):
+        try:
+            base_url, current_session_id = await ensure_session_backend(
+                current_session_id, agent, project_dir
+            )
+            result = await send_opencode_prompt(
+                base_url, current_session_id, agent, prompt, timeout_seconds
+            )
+        except _TRANSIENT_SERVER_ERRORS:
+            if attempt == 1:
+                raise
+            logger.exception(
+                "Lost connection to opencode serve for session %s; restarting and retrying once",
+                current_session_id,
+            )
+            if current_session_id is not None:
+                _evict_and_kill_session_backend(current_session_id)
+            continue
 
-    await ensure_visible_terminal(base_url, session_id, agent, project_dir)
-
-    result = await send_opencode_prompt(
-        base_url, session_id, agent, prompt, timeout_seconds
-    )
+        session_id = current_session_id
+        break
 
     info = result.get("info")
     info = info if isinstance(info, dict) else {}

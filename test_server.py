@@ -4,13 +4,12 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx2
 
 import server
-from server import (
-    extract_orca_terminal_handle,
-    parse_json_output,
-)
+from server import parse_json_output
 
 
 class ParseJsonOutputTests(unittest.TestCase):
@@ -71,28 +70,6 @@ trailing log noise after the JSON"""
     def test_non_dict_json_raises(self):
         with self.assertRaises(RuntimeError):
             parse_json_output("[1, 2, 3]")
-
-
-class ExtractOrcaTerminalHandleTests(unittest.TestCase):
-    def test_valid_nested_handle(self):
-        result = {"result": {"terminal": {"handle": "term_1"}}}
-        self.assertEqual(extract_orca_terminal_handle(result), "term_1")
-
-    def test_missing_handle_raises(self):
-        with self.assertRaises(RuntimeError):
-            extract_orca_terminal_handle({"result": {"terminal": {}}})
-
-    def test_missing_terminal_raises(self):
-        with self.assertRaises(RuntimeError):
-            extract_orca_terminal_handle({"result": {}})
-
-    def test_missing_result_raises(self):
-        with self.assertRaises(RuntimeError):
-            extract_orca_terminal_handle({})
-
-    def test_non_dict_result_does_not_crash(self):
-        with self.assertRaises(RuntimeError):
-            extract_orca_terminal_handle({"result": "not-a-dict"})
 
 
 class LoadBrowserConfigTests(unittest.TestCase):
@@ -244,6 +221,13 @@ class CreateOpencodeSessionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await server.create_opencode_session("http://x", title="t")
 
+    async def test_non_dict_response_raises(self):
+        mock_client = make_mock_client(FakeResponse(json_data=["not", "a", "dict"]))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            with self.assertRaises(RuntimeError):
+                await server.create_opencode_session("http://x", title="t")
+
 
 class SendOpencodePromptTests(unittest.IsolatedAsyncioTestCase):
     async def test_posts_expected_body_and_returns_json(self):
@@ -270,9 +254,16 @@ class SendOpencodePromptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("boom", str(ctx.exception))
 
+    async def test_non_dict_response_raises(self):
+        mock_client = make_mock_client(FakeResponse(json_data=["not", "a", "dict"]))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            with self.assertRaises(RuntimeError):
+                await server.send_opencode_prompt("http://x", "ses_1", "reviewer", "do it", 30)
+
 
 # ---------------------------------------------------------------------------
-# opencode serve process management.
+# Per-session opencode serve process + Orca pane management.
 # ---------------------------------------------------------------------------
 
 
@@ -301,43 +292,92 @@ class FakeProcess:
         return self.returncode
 
 
-class EnsureOpencodeServerTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        server._opencode_servers.clear()
+class CreateSessionPaneTests(unittest.IsolatedAsyncioTestCase):
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_parses_full_pane_identity(self, mock_run_command):
+        payload = json.dumps(
+            {"result": {"terminal": {"handle": "term_1", "paneKey": "tab:leaf", "tabId": "tab"}}}
+        )
+        mock_run_command.return_value = (0, payload, "")
 
-    async def test_starts_and_caches_by_project_dir(self):
+        pane = await server._create_session_pane("reviewer", Path("/tmp/p"))
+
+        self.assertEqual(pane, ("term_1", "tab:leaf", "tab"))
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_returns_none_on_command_failure(self, mock_run_command):
+        mock_run_command.return_value = (1, "", "orca not running")
+
+        pane = await server._create_session_pane("reviewer", Path("/tmp/p"))
+
+        self.assertIsNone(pane)
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_returns_none_on_incomplete_identity(self, mock_run_command):
+        payload = json.dumps({"result": {"terminal": {"handle": "term_1"}}})
+        mock_run_command.return_value = (0, payload, "")
+
+        pane = await server._create_session_pane("reviewer", Path("/tmp/p"))
+
+        self.assertIsNone(pane)
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_returns_none_on_exception(self, mock_run_command):
+        mock_run_command.side_effect = RuntimeError("boom")
+
+        pane = await server._create_session_pane("reviewer", Path("/tmp/p"))
+
+        self.assertIsNone(pane)
+
+
+class SessionServerEnvTests(unittest.TestCase):
+    def test_with_pane_overrides_identity_vars(self):
+        with patch.dict(os.environ, {"ORCA_PANE_KEY": "old", "ORCA_TAB_ID": "old", "OTHER": "z"}):
+            env = server._session_server_env(("term_1", "new_pane", "new_tab"))
+
+        self.assertEqual(env["ORCA_PANE_KEY"], "new_pane")
+        self.assertEqual(env["ORCA_TAB_ID"], "new_tab")
+        self.assertEqual(env["ORCA_TERMINAL_HANDLE"], "term_1")
+        self.assertEqual(env.get("OTHER"), "z")
+
+    def test_without_pane_strips_identity_vars(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ORCA_PANE_KEY": "old",
+                "ORCA_TAB_ID": "old",
+                "ORCA_TERMINAL_HANDLE": "old",
+                "OTHER": "z",
+            },
+        ):
+            env = server._session_server_env(None)
+
+        self.assertNotIn("ORCA_PANE_KEY", env)
+        self.assertNotIn("ORCA_TAB_ID", env)
+        self.assertNotIn("ORCA_TERMINAL_HANDLE", env)
+        self.assertEqual(env.get("OTHER"), "z")
+
+    def test_leaves_hook_infrastructure_vars_untouched(self):
+        with patch.dict(
+            os.environ, {"ORCA_OPENCODE_CONFIG_DIR": "/x", "ORCA_AGENT_HOOK_PORT": "1"}
+        ):
+            env_with = server._session_server_env(("h", "p", "t"))
+            env_without = server._session_server_env(None)
+
+        self.assertEqual(env_with.get("ORCA_OPENCODE_CONFIG_DIR"), "/x")
+        self.assertEqual(env_without.get("ORCA_OPENCODE_CONFIG_DIR"), "/x")
+        self.assertEqual(env_with.get("ORCA_AGENT_HOOK_PORT"), "1")
+
+
+class SpawnSessionServerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_returns_process_and_base_url(self):
         process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
 
         with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-            base_url = await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-1"))
+            result_process, base_url = await server._spawn_session_server(Path("/tmp/p"), None)
 
+        self.assertIs(result_process, process)
         self.assertEqual(base_url, "http://127.0.0.1:4096")
-        self.assertIn(Path("/tmp/orca-bridge-proj-1"), server._opencode_servers)
-
-    async def test_reuses_cached_server_when_still_alive(self):
-        process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
-        mock_exec = AsyncMock(return_value=process)
-
-        with patch("server.asyncio.create_subprocess_exec", new=mock_exec):
-            await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-2"))
-            await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-2"))
-
-        mock_exec.assert_awaited_once()
-
-    async def test_respawns_when_cached_process_died(self):
-        dead_process = FakeProcess([], returncode=1)
-        alive_process = FakeProcess([b"opencode server listening on http://127.0.0.1:4097\n"])
-        server._opencode_servers[Path("/tmp/orca-bridge-proj-3")] = (
-            dead_process,
-            "http://127.0.0.1:4096",
-        )
-
-        with patch(
-            "server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=alive_process)
-        ):
-            base_url = await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-3"))
-
-        self.assertEqual(base_url, "http://127.0.0.1:4097")
 
     @patch("server.os.killpg")
     @patch("server.os.getpgid", return_value=1)
@@ -346,7 +386,23 @@ class EnsureOpencodeServerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
             with self.assertRaises(RuntimeError):
-                await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-4"))
+                await server._spawn_session_server(Path("/tmp/p"), None)
+
+    @patch("server.os.killpg")
+    @patch("server.os.getpgid", return_value=1)
+    async def test_exit_code_in_error_reflects_post_wait_value(self, mock_getpgid, mock_killpg):
+        # returncode starts as None (as it would be immediately after EOF,
+        # before asyncio has necessarily updated it) and FakeProcess.wait()
+        # is what finalizes it to -9 -- the error message must reflect that
+        # finalized value, not the pre-wait None.
+        process = FakeProcess([b"no listening line here\n"], returncode=None)
+
+        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+            with self.assertRaises(RuntimeError) as ctx:
+                await server._spawn_session_server(Path("/tmp/p"), None)
+
+        self.assertIn("-9", str(ctx.exception))
+        self.assertNotIn("None", str(ctx.exception))
 
     @patch("server.os.killpg")
     @patch("server.os.getpgid", return_value=1)
@@ -356,64 +412,244 @@ class EnsureOpencodeServerTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
             with self.assertRaises(asyncio.TimeoutError):
-                await server.ensure_opencode_server(Path("/tmp/orca-bridge-proj-5"))
+                await server._spawn_session_server(Path("/tmp/p"), None)
 
         mock_killpg.assert_called_once()
 
+    async def test_passes_pane_env_to_subprocess(self):
+        process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
+        mock_exec = AsyncMock(return_value=process)
 
-# ---------------------------------------------------------------------------
-# Visibility terminal (best-effort, never allowed to break the data flow).
-# ---------------------------------------------------------------------------
+        with patch("server.asyncio.create_subprocess_exec", new=mock_exec):
+            await server._spawn_session_server(Path("/tmp/p"), ("term_1", "pane_1", "tab_1"))
+
+        _args, kwargs = mock_exec.call_args
+        self.assertEqual(kwargs["env"]["ORCA_PANE_KEY"], "pane_1")
 
 
-class EnsureVisibleTerminalTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        server._session_terminals.clear()
-
+class AttachTerminalToSessionTests(unittest.IsolatedAsyncioTestCase):
     @patch("server.run_command", new_callable=AsyncMock)
-    async def test_does_not_recreate_when_terminal_alive(self, mock_run_command):
-        server._session_terminals["ses_1"] = "term_existing"
+    async def test_sends_attach_command(self, mock_run_command):
         mock_run_command.return_value = (0, "{}", "")
 
-        await server.ensure_visible_terminal("http://x", "ses_1", "reviewer", Path("/tmp/p"))
+        await server._attach_terminal_to_session("term_1", "http://x", "ses_1")
 
-        mock_run_command.assert_awaited_once()
         args = mock_run_command.await_args.args[0]
-        self.assertIn("show", args)
-        self.assertEqual(server._session_terminals["ses_1"], "term_existing")
+        self.assertIn("send", args)
+        self.assertIn("opencode attach http://x --session ses_1", " ".join(args))
 
     @patch("server.run_command", new_callable=AsyncMock)
-    async def test_creates_terminal_when_none_tracked(self, mock_run_command):
-        create_output = json.dumps({"result": {"terminal": {"handle": "term_new"}}})
-        mock_run_command.return_value = (0, create_output, "")
+    async def test_failure_is_swallowed(self, mock_run_command):
+        mock_run_command.side_effect = RuntimeError("boom")
 
-        await server.ensure_visible_terminal("http://x:1", "ses_2", "implementer", Path("/tmp/p"))
+        await server._attach_terminal_to_session("term_1", "http://x", "ses_1")  # must not raise
 
-        self.assertEqual(server._session_terminals["ses_2"], "term_new")
-        args = mock_run_command.await_args.args[0]
-        self.assertIn("create", args)
-        self.assertIn("opencode attach http://x:1 --session ses_2", " ".join(args))
+
+class CreateSessionBackendTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._session_state.clear()
+
+    @patch("server._attach_terminal_to_session", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server._spawn_session_server", new_callable=AsyncMock)
+    @patch("server._create_session_pane", new_callable=AsyncMock)
+    async def test_new_session_creates_pane_server_and_session(
+        self, mock_create_pane, mock_spawn, mock_create_session, mock_attach
+    ):
+        process = FakeProcess([])
+        mock_create_pane.return_value = ("term_1", "pane_1", "tab_1")
+        mock_spawn.return_value = (process, "http://x")
+        mock_create_session.return_value = "ses_new"
+
+        base_url, session_id = await server._create_session_backend(
+            None, "reviewer", Path("/tmp/p")
+        )
+
+        self.assertEqual((base_url, session_id), ("http://x", "ses_new"))
+        mock_spawn.assert_awaited_once_with(Path("/tmp/p"), ("term_1", "pane_1", "tab_1"))
+        mock_attach.assert_awaited_once_with("term_1", "http://x", "ses_new")
+        self.assertEqual(server._session_state["ses_new"], (process, "http://x", "term_1"))
+
+    @patch("server._attach_terminal_to_session", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server._spawn_session_server", new_callable=AsyncMock)
+    @patch("server._create_session_pane", new_callable=AsyncMock)
+    async def test_falls_back_to_headless_when_orca_unavailable(
+        self, mock_create_pane, mock_spawn, mock_create_session, mock_attach
+    ):
+        process = FakeProcess([])
+        mock_create_pane.return_value = None
+        mock_spawn.return_value = (process, "http://x")
+        mock_create_session.return_value = "ses_new"
+
+        await server._create_session_backend(None, "reviewer", Path("/tmp/p"))
+
+        mock_spawn.assert_awaited_once_with(Path("/tmp/p"), None)
+        mock_attach.assert_not_awaited()
+        self.assertEqual(server._session_state["ses_new"], (process, "http://x", None))
+
+    @patch("server._attach_terminal_to_session", new_callable=AsyncMock)
+    @patch("server.create_opencode_session", new_callable=AsyncMock)
+    @patch("server._spawn_session_server", new_callable=AsyncMock)
+    @patch("server._create_session_pane", new_callable=AsyncMock)
+    async def test_existing_session_id_skips_create_opencode_session(
+        self, mock_create_pane, mock_spawn, mock_create_session, mock_attach
+    ):
+        process = FakeProcess([])
+        mock_create_pane.return_value = None
+        mock_spawn.return_value = (process, "http://x")
+
+        base_url, session_id = await server._create_session_backend(
+            "ses_existing", "reviewer", Path("/tmp/p")
+        )
+
+        self.assertEqual(session_id, "ses_existing")
+        mock_create_session.assert_not_awaited()
+
+
+class EnsureSessionBackendTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._session_state.clear()
+
+    @patch("server._create_session_backend", new_callable=AsyncMock)
+    async def test_new_session_always_creates(self, mock_create_backend):
+        mock_create_backend.return_value = ("http://x", "ses_new")
+
+        result = await server.ensure_session_backend(None, "reviewer", Path("/tmp/p"))
+
+        self.assertEqual(result, ("http://x", "ses_new"))
+        mock_create_backend.assert_awaited_once_with(None, "reviewer", Path("/tmp/p"))
 
     @patch("server.run_command", new_callable=AsyncMock)
-    async def test_recreates_when_tracked_terminal_is_gone(self, mock_run_command):
-        server._session_terminals["ses_3"] = "term_stale"
-        create_output = json.dumps({"result": {"terminal": {"handle": "term_fresh"}}})
-        mock_run_command.side_effect = [
-            (1, "", "not found"),
-            (0, create_output, ""),
-        ]
+    @patch("server._create_session_backend", new_callable=AsyncMock)
+    async def test_reuses_when_server_and_terminal_alive(self, mock_create_backend, mock_run_command):
+        process = FakeProcess([], returncode=None)
+        server._session_state["ses_1"] = (process, "http://x", "term_1")
+        mock_run_command.return_value = (0, "{}", "")
 
-        await server.ensure_visible_terminal("http://x", "ses_3", "reviewer", Path("/tmp/p"))
+        result = await server.ensure_session_backend("ses_1", "reviewer", Path("/tmp/p"))
 
-        self.assertEqual(server._session_terminals["ses_3"], "term_fresh")
+        self.assertEqual(result, ("http://x", "ses_1"))
+        mock_create_backend.assert_not_awaited()
 
     @patch("server.run_command", new_callable=AsyncMock)
-    async def test_failure_is_swallowed_never_raises(self, mock_run_command):
-        mock_run_command.side_effect = RuntimeError("orca is not running")
+    @patch("server._create_session_backend", new_callable=AsyncMock)
+    async def test_recreates_when_server_dead(self, mock_create_backend, mock_run_command):
+        dead_process = FakeProcess([], returncode=0)
+        server._session_state["ses_1"] = (dead_process, "http://x", "term_1")
+        mock_create_backend.return_value = ("http://y", "ses_1")
 
-        await server.ensure_visible_terminal("http://x", "ses_4", "reviewer", Path("/tmp/p"))
+        result = await server.ensure_session_backend("ses_1", "reviewer", Path("/tmp/p"))
 
-        self.assertNotIn("ses_4", server._session_terminals)
+        self.assertEqual(result, ("http://y", "ses_1"))
+        mock_create_backend.assert_awaited_once_with("ses_1", "reviewer", Path("/tmp/p"))
+        mock_run_command.assert_not_awaited()  # server already dead, no need to check the terminal
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    @patch("server._create_session_backend", new_callable=AsyncMock)
+    async def test_recreates_when_terminal_gone(self, mock_create_backend, mock_run_command):
+        process = FakeProcess([], returncode=None)
+        server._session_state["ses_1"] = (process, "http://x", "term_1")
+        mock_run_command.return_value = (1, "", "not found")
+        mock_create_backend.return_value = ("http://y", "ses_1")
+
+        result = await server.ensure_session_backend("ses_1", "reviewer", Path("/tmp/p"))
+
+        self.assertEqual(result, ("http://y", "ses_1"))
+        mock_create_backend.assert_awaited_once_with("ses_1", "reviewer", Path("/tmp/p"))
+
+    @patch("server._create_session_backend", new_callable=AsyncMock)
+    async def test_concurrent_calls_do_not_double_create(self, mock_create_backend):
+        call_count = 0
+
+        async def fake_create_backend(session_id, agent, project_dir):
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0.01)
+            server._session_state[session_id] = (FakeProcess([], returncode=None), "http://x", None)
+            return "http://x", session_id
+
+        mock_create_backend.side_effect = fake_create_backend
+
+        await asyncio.gather(
+            server.ensure_session_backend("ses_concurrent", "reviewer", Path("/tmp/p")),
+            server.ensure_session_backend("ses_concurrent", "reviewer", Path("/tmp/p")),
+        )
+
+        self.assertEqual(call_count, 1)
+
+
+class KillOpencodeServersTests(unittest.TestCase):
+    def setUp(self):
+        server._session_state.clear()
+
+    @patch("server.os.killpg")
+    @patch("server.os.getpgid", return_value=42)
+    def test_kills_live_processes_only(self, mock_getpgid, mock_killpg):
+        live = FakeProcess([], pid=111, returncode=None)
+        dead = FakeProcess([], pid=222, returncode=0)
+        server._session_state["ses_a"] = (live, "http://x", "term_a")
+        server._session_state["ses_b"] = (dead, "http://y", "term_b")
+
+        server._kill_opencode_servers()
+
+        mock_getpgid.assert_called_once_with(111)
+        mock_killpg.assert_called_once_with(42, server.signal.SIGTERM)
+
+    @patch("server.os.killpg", side_effect=[Exception("boom"), None])
+    @patch("server.os.getpgid", return_value=42)
+    def test_exception_on_one_does_not_block_others(self, mock_getpgid, mock_killpg):
+        live1 = FakeProcess([], pid=111, returncode=None)
+        live2 = FakeProcess([], pid=222, returncode=None)
+        server._session_state["ses_c"] = (live1, "http://x", None)
+        server._session_state["ses_d"] = (live2, "http://y", None)
+
+        server._kill_opencode_servers()  # must not raise
+
+        self.assertEqual(mock_killpg.call_count, 2)
+
+
+class InstallTerminationCleanupTests(unittest.TestCase):
+    def test_chains_to_previous_callable_handler(self):
+        previous = MagicMock()
+        installed_handlers = {}
+
+        with patch("server.signal.getsignal", return_value=previous), \
+             patch("server.signal.signal", side_effect=lambda sig, h: installed_handlers.__setitem__(sig, h)), \
+             patch("server._kill_opencode_servers") as mock_kill:
+            server._install_termination_cleanup()
+
+            self.assertIn(server.signal.SIGTERM, installed_handlers)
+            installed_handlers[server.signal.SIGTERM](server.signal.SIGTERM, None)
+
+            mock_kill.assert_called_once()
+        previous.assert_called_once_with(server.signal.SIGTERM, None)
+
+    def test_falls_back_to_default_when_previous_is_sig_dfl(self):
+        installed_handlers = {}
+
+        with patch("server.signal.getsignal", return_value=server.signal.SIG_DFL), \
+             patch("server.signal.signal", side_effect=lambda sig, h: installed_handlers.__setitem__(sig, h)), \
+             patch("server._kill_opencode_servers") as mock_kill, \
+             patch("server.os.kill") as mock_os_kill:
+            server._install_termination_cleanup()
+            installed_handlers[server.signal.SIGTERM](server.signal.SIGTERM, None)
+
+            mock_kill.assert_called_once()
+            mock_os_kill.assert_called_once()
+
+    def test_leaves_sig_ign_untouched(self):
+        installed_handlers = {}
+
+        with patch("server.signal.getsignal", return_value=server.signal.SIG_IGN), \
+             patch("server.signal.signal", side_effect=lambda sig, h: installed_handlers.__setitem__(sig, h)), \
+             patch("server._kill_opencode_servers") as mock_kill, \
+             patch("server.os.kill") as mock_os_kill:
+            server._install_termination_cleanup()
+            installed_handlers[server.signal.SIGTERM](server.signal.SIGTERM, None)
+
+            mock_kill.assert_called_once()
+            mock_os_kill.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -423,14 +659,11 @@ class EnsureVisibleTerminalTests(unittest.IsolatedAsyncioTestCase):
 
 class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
-    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
-    @patch("server.create_opencode_session", new_callable=AsyncMock)
-    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
     async def test_creates_new_session_when_none_given(
-        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
+        self, mock_ensure_backend, mock_send_prompt
     ):
-        mock_ensure_server.return_value = "http://127.0.0.1:4096"
-        mock_create_session.return_value = "ses_new"
+        mock_ensure_backend.return_value = ("http://127.0.0.1:4096", "ses_new")
         mock_send_prompt.return_value = {
             "info": {"finish": "stop"},
             "parts": [{"type": "text", "text": "hello "}, {"type": "text", "text": "world"}],
@@ -441,36 +674,29 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             result, {"session_id": "ses_new", "response": "hello world", "finish_reason": "stop"}
         )
-        mock_create_session.assert_awaited_once()
+        mock_ensure_backend.assert_awaited_once_with(None, "reviewer", server.get_project_dir())
         mock_send_prompt.assert_awaited_once_with(
             "http://127.0.0.1:4096", "ses_new", "reviewer", "do it",
             server.OPENCODE_PROMPT_TIMEOUT_SECONDS,
         )
 
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
-    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
-    @patch("server.create_opencode_session", new_callable=AsyncMock)
-    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
-    async def test_reuses_given_session_id(
-        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
-    ):
-        mock_ensure_server.return_value = "http://x"
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_reuses_given_session_id(self, mock_ensure_backend, mock_send_prompt):
+        mock_ensure_backend.return_value = ("http://x", "ses_existing")
         mock_send_prompt.return_value = {"info": {"finish": "stop"}, "parts": []}
 
         result = await server.run_opencode(agent="reviewer", prompt="do it", session_id="ses_existing")
 
         self.assertEqual(result["session_id"], "ses_existing")
-        mock_create_session.assert_not_awaited()
+        mock_ensure_backend.assert_awaited_once_with(
+            "ses_existing", "reviewer", server.get_project_dir()
+        )
 
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
-    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
-    @patch("server.create_opencode_session", new_callable=AsyncMock)
-    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
-    async def test_error_in_info_raises(
-        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
-    ):
-        mock_ensure_server.return_value = "http://x"
-        mock_create_session.return_value = "ses_1"
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_error_in_info_raises(self, mock_ensure_backend, mock_send_prompt):
+        mock_ensure_backend.return_value = ("http://x", "ses_1")
         mock_send_prompt.return_value = {"info": {"error": {"message": "boom"}}, "parts": []}
 
         with self.assertRaises(RuntimeError) as ctx:
@@ -479,14 +705,9 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("boom", str(ctx.exception))
 
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
-    @patch("server.ensure_visible_terminal", new_callable=AsyncMock)
-    @patch("server.create_opencode_session", new_callable=AsyncMock)
-    @patch("server.ensure_opencode_server", new_callable=AsyncMock)
-    async def test_non_text_parts_are_ignored(
-        self, mock_ensure_server, mock_create_session, mock_ensure_terminal, mock_send_prompt
-    ):
-        mock_ensure_server.return_value = "http://x"
-        mock_create_session.return_value = "ses_1"
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_non_text_parts_are_ignored(self, mock_ensure_backend, mock_send_prompt):
+        mock_ensure_backend.return_value = ("http://x", "ses_1")
         mock_send_prompt.return_value = {
             "info": {"finish": "stop"},
             "parts": [
@@ -499,6 +720,83 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         result = await server.run_opencode(agent="reviewer", prompt="do it")
 
         self.assertEqual(result["response"], "kept")
+
+    @patch("server.os.killpg")
+    @patch("server.os.getpgid", return_value=1)
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_retries_once_after_transport_error(
+        self, mock_ensure_backend, mock_send_prompt, mock_getpgid, mock_killpg
+    ):
+        mock_ensure_backend.side_effect = [
+            ("http://first", "ses_new"),
+            ("http://second", "ses_new"),
+        ]
+        mock_send_prompt.side_effect = [
+            httpx2.ConnectError("boom"),
+            {"info": {"finish": "stop"}, "parts": [{"type": "text", "text": "ok"}]},
+        ]
+        stale_process = FakeProcess([], pid=999, returncode=None)
+        server._session_state["ses_new"] = (stale_process, "http://first", None)
+
+        result = await server.run_opencode(agent="reviewer", prompt="do it")
+
+        self.assertEqual(result["response"], "ok")
+        self.assertEqual(mock_ensure_backend.await_count, 2)
+        self.assertEqual(mock_send_prompt.await_count, 2)
+        self.assertNotIn("ses_new", server._session_state)
+        # The stale server must actually be killed, not just forgotten --
+        # otherwise it leaks as an untracked, unkillable orphan.
+        mock_killpg.assert_called_once_with(1, server.signal.SIGTERM)
+        # The second attempt must reuse the session_id learned from the first
+        # (not start over with session_id=None), so history isn't lost.
+        second_call_args = mock_ensure_backend.await_args_list[1].args
+        self.assertEqual(second_call_args[0], "ses_new")
+
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_read_timeout_does_not_trigger_retry(
+        self, mock_ensure_backend, mock_send_prompt
+    ):
+        # A slow-but-connected call must not be torn down and retried just
+        # because it took a while -- only actual connection failures should.
+        mock_ensure_backend.return_value = ("http://x", "ses_1")
+        mock_send_prompt.side_effect = httpx2.ReadTimeout("slow")
+
+        with self.assertRaises(httpx2.ReadTimeout):
+            await server.run_opencode(agent="reviewer", prompt="do it")
+
+        mock_send_prompt.assert_awaited_once()
+
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_raises_after_second_transport_error(
+        self, mock_ensure_backend, mock_send_prompt
+    ):
+        mock_ensure_backend.return_value = ("http://x", "ses_1")
+        mock_send_prompt.side_effect = httpx2.ConnectError("boom")
+
+        with self.assertRaises(httpx2.TransportError):
+            await server.run_opencode(agent="reviewer", prompt="do it")
+
+        self.assertEqual(mock_send_prompt.await_count, 2)
+
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_retry_reuses_explicit_session_id(
+        self, mock_ensure_backend, mock_send_prompt
+    ):
+        mock_ensure_backend.return_value = ("http://x", "ses_existing")
+        mock_send_prompt.side_effect = [
+            httpx2.ConnectError("boom"),
+            {"info": {"finish": "stop"}, "parts": []},
+        ]
+
+        result = await server.run_opencode(agent="reviewer", prompt="do it", session_id="ses_existing")
+
+        self.assertEqual(result["session_id"], "ses_existing")
+        for call in mock_ensure_backend.await_args_list:
+            self.assertEqual(call.args[0], "ses_existing")
 
 
 class ToolWrapperTests(unittest.IsolatedAsyncioTestCase):
