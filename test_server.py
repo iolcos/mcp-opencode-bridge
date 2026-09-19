@@ -799,50 +799,151 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call.args[0], "ses_existing")
 
 
-class ToolWrapperTests(unittest.IsolatedAsyncioTestCase):
-    @patch("server.run_opencode", new_callable=AsyncMock)
-    async def test_review_converts_failure_to_tool_error(self, mock_run_opencode):
-        mock_run_opencode.side_effect = RuntimeError("underlying failure")
+class RegisterAgentToolTests(unittest.IsolatedAsyncioTestCase):
+    """
+    _register_agent_tool() builds the handler that becomes a dynamically
+    registered MCP tool for one agent. Tested by capturing the handler
+    mcp.add_tool() would otherwise receive, instead of exercising the real
+    tool registry (which already owns "implementer"/"reviewer" from the
+    module-level discovery loop and would reject a same-name re-registration).
+    """
 
-        with self.assertRaises(server.ToolError) as ctx:
-            await server.review(plan="check this")
+    def _capture_handler(self, name: str, description: str):
+        captured = {}
 
-        self.assertIn("underlying failure", str(ctx.exception))
+        def fake_add_tool(fn, name=None, description=None):
+            captured["fn"] = fn
+            captured["name"] = name
+            captured["description"] = description
 
-    @patch("server.run_opencode", new_callable=AsyncMock)
-    async def test_review_passes_through_success(self, mock_run_opencode):
-        mock_run_opencode.return_value = {
-            "session_id": "ses_1",
-            "response": "looks good",
-            "finish_reason": "stop",
-        }
+        with patch.object(server.mcp, "add_tool", side_effect=fake_add_tool):
+            server._register_agent_tool(name, description)
 
-        result = await server.review(plan="check this", session_id="ses_1")
+        return captured
 
-        self.assertEqual(result["response"], "looks good")
-        call_kwargs = mock_run_opencode.await_args.kwargs
-        self.assertEqual(call_kwargs["agent"], "reviewer")
-        self.assertEqual(call_kwargs["session_id"], "ses_1")
-        self.assertIn("check this", call_kwargs["prompt"])
+    async def test_success_calls_run_opencode_with_agent_name(self):
+        captured = self._capture_handler("implementer", "Implements stuff")
+        self.assertEqual(captured["name"], "implementer")
+        self.assertEqual(captured["description"], "Implements stuff")
 
-    @patch("server.run_opencode", new_callable=AsyncMock)
-    async def test_implement_converts_failure_to_tool_error(self, mock_run_opencode):
-        mock_run_opencode.side_effect = RuntimeError("underlying failure")
-
-        with self.assertRaises(server.ToolError):
-            await server.implement(plan="do this")
-
-    @patch("server.run_opencode", new_callable=AsyncMock)
-    async def test_implement_passes_through_success(self, mock_run_opencode):
-        mock_run_opencode.return_value = {"response": "done"}
-
-        result = await server.implement(plan="do this")
+        with patch("server.run_opencode", new_callable=AsyncMock) as mock_run_opencode:
+            mock_run_opencode.return_value = {
+                "session_id": "ses_1",
+                "response": "done",
+                "finish_reason": "stop",
+            }
+            result = await captured["fn"](plan="do this", session_id="ses_1")
 
         self.assertEqual(result["response"], "done")
+        call_kwargs = mock_run_opencode.await_args.kwargs
+        self.assertEqual(call_kwargs["agent"], "implementer")
+        self.assertEqual(call_kwargs["session_id"], "ses_1")
+        self.assertEqual(call_kwargs["prompt"], "do this")
+
+    async def test_failure_converts_to_tool_error(self):
+        captured = self._capture_handler("reviewer", "Reviews stuff")
+
+        with patch("server.run_opencode", new_callable=AsyncMock) as mock_run_opencode:
+            mock_run_opencode.side_effect = RuntimeError("underlying failure")
+            with self.assertRaises(server.ToolError) as ctx:
+                await captured["fn"](plan="check this")
+
+        self.assertIn("underlying failure", str(ctx.exception))
 
     async def test_review_browser_raises_tool_error(self):
         with self.assertRaises(server.ToolError):
             await server.review_browser(test_plan="x", account="demo")
+
+
+class DiscoverAgentsTests(unittest.TestCase):
+    @staticmethod
+    def _write_agent(directory: Path, slug: str, frontmatter_body: str) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{slug}.md").write_text(
+            f"---\n{frontmatter_body}\n---\n\nSome agent instructions.\n",
+            encoding="utf-8",
+        )
+
+    def _discover(self, home: Path, project_dir: Path) -> dict:
+        with patch.object(Path, "home", return_value=home):
+            return server.discover_agents(project_dir)
+
+    def test_discovers_global_agent_with_description(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            home = Path(home_dir)
+            self._write_agent(
+                home / ".config" / "opencode" / "agent", "coder", "description: Writes code"
+            )
+
+            agents = self._discover(home, Path(project_dir))
+
+        self.assertEqual(agents, {"coder": "Writes code"})
+
+    def test_missing_description_falls_back_to_generic_text(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            home = Path(home_dir)
+            self._write_agent(home / ".config" / "opencode" / "agent", "coder", "mode: primary")
+
+            agents = self._discover(home, Path(project_dir))
+
+        self.assertEqual(agents, {"coder": "Run the 'coder' OpenCode agent"})
+
+    def test_malformed_closing_delimiter_is_skipped(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            home = Path(home_dir)
+            agent_dir = home / ".config" / "opencode" / "agent"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "review-browser.md").write_text(
+                "---\ndescription: Broken\n-----------------------\n\nBody.\n",
+                encoding="utf-8",
+            )
+
+            agents = self._discover(home, Path(project_dir))
+
+        self.assertEqual(agents, {})
+
+    def test_invalid_yaml_is_skipped(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            home = Path(home_dir)
+            self._write_agent(
+                home / ".config" / "opencode" / "agent", "broken", "description: [unterminated"
+            )
+
+            agents = self._discover(home, Path(project_dir))
+
+        self.assertEqual(agents, {})
+
+    def test_no_frontmatter_is_skipped(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            home = Path(home_dir)
+            agent_dir = home / ".config" / "opencode" / "agent"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "plain.md").write_text("Just a plain agent file.\n", encoding="utf-8")
+
+            agents = self._discover(home, Path(project_dir))
+
+        self.assertEqual(agents, {})
+
+    def test_project_agent_overrides_global_of_same_name(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            home = Path(home_dir)
+            project_dir_path = Path(project_dir)
+            self._write_agent(
+                home / ".config" / "opencode" / "agent", "reviewer", "description: Global reviewer"
+            )
+            self._write_agent(
+                project_dir_path / ".opencode" / "agent", "reviewer", "description: Project reviewer"
+            )
+
+            agents = self._discover(home, project_dir_path)
+
+        self.assertEqual(agents, {"reviewer": "Project reviewer"})
+
+    def test_missing_agent_directories_return_empty(self):
+        with tempfile.TemporaryDirectory() as home_dir, tempfile.TemporaryDirectory() as project_dir:
+            agents = self._discover(Path(home_dir), Path(project_dir) / "does-not-exist")
+
+        self.assertEqual(agents, {})
 
 
 if __name__ == "__main__":

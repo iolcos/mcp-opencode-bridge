@@ -615,110 +615,82 @@ async def run_opencode(
     }
 
 
-@mcp.tool()
-async def implement(
-    plan: str,
-    session_id: str | None = None,
-) -> dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Dynamic agent discovery.
+#
+# Each OpenCode agent (~/.config/opencode/agent/*.md, overridden per-project
+# by <project_dir>/.opencode/agent/*.md) becomes its own MCP tool, named and
+# described from the agent's own frontmatter. Adding an agent is then just
+# dropping a .md file -- no server.py change needed.
+# ---------------------------------------------------------------------------
+
+AGENT_FRONTMATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
+
+
+def _parse_agent_frontmatter(path: Path) -> dict[str, Any] | None:
     try:
-        return await run_opencode(
-            agent="implementer",
-            session_id=session_id,
-            prompt=f"""
-You are the implementation agent.
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        logger.warning("Skipping agent %s: could not read file", path)
+        return None
 
-An architect has approved the following implementation plan:
-
---- PLAN ---
-
-{plan}
-
---- END PLAN ---
-
-Implement this plan in the current repository.
-
-Rules:
-- Inspect the existing code before making changes.
-- Follow the plan.
-- Follow the project CLAUDE.md.
-- Do not redesign the architecture.
-- Do not make unrelated improvements.
-- Do not read the .env file.
-- Do not run artisan, migrations, composer or tests.
-- Instead, report the commands that should be executed by the user.
-- Fix implementation errors you encounter that do not require running commands yourself.
-
-At the end report:
-- files changed
-- implementation details
-- commands the user should execute
-- remaining issues
-- uncertainties
-""",
-        )
-    except Exception as exc:
-        logger.exception("implement() failed")
-        raise ToolError(str(exc)) from exc
-
-
-@mcp.tool()
-async def review(
-    plan: str,
-    session_id: str | None = None,
-) -> dict[str, Any]:
+    match = AGENT_FRONTMATTER_RE.match(text)
+    if not match:
+        logger.warning("Skipping agent %s: no valid frontmatter delimiter", path)
+        return None
     try:
-        return await run_opencode(
-            agent="reviewer",
-            session_id=session_id,
-            prompt=f"""
-You are the review agent.
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        logger.warning("Skipping agent %s: invalid YAML frontmatter", path)
+        return None
 
-Review the current implementation against this approved plan:
+    if not isinstance(data, dict):
+        logger.warning("Skipping agent %s: frontmatter is not a YAML object", path)
+        return None
 
---- PLAN ---
+    return data
 
-{plan}
 
---- END PLAN ---
+def discover_agents(project_dir: Path) -> dict[str, str]:
+    """
+    Scan the global and project-local OpenCode agent directories and return
+    {agent_slug: description}. Project-local agents (<project_dir>/.opencode/agent)
+    override global ones (~/.config/opencode/agent) of the same name.
+    """
+    agents: dict[str, str] = {}
 
-Rules:
-- Do not modify files.
-- Follow the project CLAUDE.md.
-- Do not read the .env file.
-- Do not run project commands.
-- Do not modify configuration.
-- Do not fix problems yourself.
-- Do not perform browser testing.
+    for directory in (
+        Path.home() / ".config" / "opencode" / "agent",
+        project_dir / ".opencode" / "agent",
+    ):
+        if not directory.is_dir():
+            continue
+        for md_file in sorted(directory.glob("*.md")):
+            frontmatter = _parse_agent_frontmatter(md_file)
+            if frontmatter is None:
+                continue
+            description = frontmatter.get("description")
+            agents[md_file.stem] = (
+                str(description) if description else f"Run the '{md_file.stem}' OpenCode agent"
+            )
 
-Check:
-- correctness
-- adherence to the plan
-- architecture
-- regressions
-- edge cases
-- security
-- maintainability
-- tests
-- project conventions
+    return agents
 
-Return:
-## BLOCKING
-...
-## NON_BLOCKING
-...
-## MISSING_TESTS
-...
-## MISSING_BROWSER_VERIFICATION
-...
-## POSITIVE
-...
-## VERDICT
-APPROVE | REQUEST_CHANGES
-""",
-        )
-    except Exception as exc:
-        logger.exception("review() failed")
-        raise ToolError(str(exc)) from exc
+
+def _register_agent_tool(name: str, description: str) -> None:
+    async def handler(plan: str, session_id: str | None = None) -> dict[str, Any]:
+        try:
+            return await run_opencode(agent=name, session_id=session_id, prompt=plan)
+        except Exception as exc:
+            logger.exception("%s() failed", name)
+            raise ToolError(str(exc)) from exc
+
+    handler.__name__ = name
+    mcp.add_tool(handler, name=name, description=description)
+
+
+for _agent_name, _agent_description in discover_agents(get_project_dir()).items():
+    _register_agent_tool(_agent_name, _agent_description)
 
 
 @mcp.tool()
