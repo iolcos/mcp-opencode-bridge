@@ -207,6 +207,57 @@ def _get_session_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+# session_id -> queue of pending opencode permission.asked event payloads,
+# fed by _watch_permission_events. Lazily populated so an event that arrives
+# before anything is watching for it isn't lost.
+_permission_queues: dict[str, asyncio.Queue] = {}
+
+# session_id -> the send_opencode_prompt() task still running server-side
+# after run_opencode() returned early with status "permission_required".
+# Kept alive (never cancelled) so answer_permission() can pick its result
+# back up once the pending permission is resolved.
+_pending_calls: dict[str, asyncio.Task] = {}
+
+
+def _get_permission_queue(session_id: str) -> asyncio.Queue:
+    queue = _permission_queues.get(session_id)
+    if queue is None:
+        queue = asyncio.Queue()
+        _permission_queues[session_id] = queue
+    return queue
+
+
+async def _wait_for_permission_event(session_id: str) -> dict[str, Any]:
+    return await _get_permission_queue(session_id).get()
+
+
+async def _watch_permission_events(session_id: str, base_url: str) -> None:
+    """
+    Long-lived per-session task: subscribes to opencode's own SSE event
+    stream and forwards every permission.asked event for this session onto
+    its queue, so a pending prompt can be raced against it instead of
+    blocking silently until OPENCODE_PROMPT_TIMEOUT_SECONDS.
+    """
+    queue = _get_permission_queue(session_id)
+    try:
+        async with httpx2.AsyncClient(timeout=None) as client:
+            async with client.stream("GET", f"{base_url}/event") as response:
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    try:
+                        event = json.loads(line[len("data: "):])
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "permission.asked":
+                        continue
+                    properties = event.get("properties")
+                    if isinstance(properties, dict) and properties.get("sessionID") == session_id:
+                        await queue.put(properties)
+    except Exception:
+        logger.exception("Permission event watcher died for session %s", session_id)
+
+
 # Keeps references to fire-and-forget background tasks (stdout drains) alive
 # for as long as the process runs -- otherwise they could be garbage
 # collected mid-flight.
@@ -239,6 +290,11 @@ def _evict_and_kill_session_backend(session_id: str) -> None:
     """Stop tracking a session's server that failed to respond, and actually
     kill it so it doesn't leak as an untracked, unkillable orphan process."""
     cached = _session_state.pop(session_id, None)
+
+    pending_task = _pending_calls.pop(session_id, None)
+    if pending_task is not None:
+        pending_task.cancel()
+    _permission_queues.pop(session_id, None)
 
     if cached is None:
         return
@@ -457,6 +513,7 @@ async def _create_session_backend(
 
     handle = pane[0] if pane is not None else None
     _session_state[session_id] = (process, base_url, handle)
+    _spawn_background_task(_watch_permission_events(session_id, base_url))
 
     if handle is not None:
         await _attach_terminal_to_session(handle, base_url, session_id)
@@ -550,43 +607,7 @@ async def send_opencode_prompt(
     return data
 
 
-async def run_opencode(
-    agent: str,
-    prompt: str,
-    session_id: str | None = None,
-    timeout_seconds: int = OPENCODE_PROMPT_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    project_dir = get_project_dir()
-    current_session_id = session_id
-
-    # Two attempts: if the session's backend turns out to be unreachable
-    # (alive per its exit code, but hung or otherwise not answering),
-    # invalidate it and retry once against a freshly spawned one before
-    # giving up. The (possibly newly created) session_id is preserved across
-    # the retry -- opencode session data persists independently of which
-    # server process created it, so conversation history isn't lost.
-    for attempt in range(2):
-        try:
-            base_url, current_session_id = await ensure_session_backend(
-                current_session_id, agent, project_dir
-            )
-            result = await send_opencode_prompt(
-                base_url, current_session_id, agent, prompt, timeout_seconds
-            )
-        except _TRANSIENT_SERVER_ERRORS:
-            if attempt == 1:
-                raise
-            logger.exception(
-                "Lost connection to opencode serve for session %s; restarting and retrying once",
-                current_session_id,
-            )
-            if current_session_id is not None:
-                _evict_and_kill_session_backend(current_session_id)
-            continue
-
-        session_id = current_session_id
-        break
-
+def _finalize_prompt_result(session_id: str, result: dict[str, Any]) -> dict[str, Any]:
     info = result.get("info")
     info = info if isinstance(info, dict) else {}
 
@@ -613,6 +634,153 @@ async def run_opencode(
         "response": text,
         "finish_reason": info.get("finish"),
     }
+
+
+def _permission_required_result(session_id: str, request: dict[str, Any]) -> dict[str, Any]:
+    request_id = request.get("id")
+    action = request.get("permission")
+    patterns = request.get("patterns")
+    return {
+        "session_id": session_id,
+        "status": "permission_required",
+        "request_id": request_id,
+        "action": action,
+        "patterns": patterns,
+        "message": (
+            f"OpenCode is asking permission to {action} ({patterns}) and nobody is "
+            "watching interactively. Decide, then call answer_permission("
+            f"session_id={session_id!r}, request_id={request_id!r}, "
+            "reply='once'|'always'|'reject') to resolve it."
+        ),
+    }
+
+
+async def run_opencode(
+    agent: str,
+    prompt: str,
+    session_id: str | None = None,
+    timeout_seconds: int = OPENCODE_PROMPT_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    project_dir = get_project_dir()
+    current_session_id = session_id
+
+    # Two attempts: if the session's backend turns out to be unreachable
+    # (alive per its exit code, but hung or otherwise not answering),
+    # invalidate it and retry once against a freshly spawned one before
+    # giving up. The (possibly newly created) session_id is preserved across
+    # the retry -- opencode session data persists independently of which
+    # server process created it, so conversation history isn't lost.
+    for attempt in range(2):
+        try:
+            base_url, current_session_id = await ensure_session_backend(
+                current_session_id, agent, project_dir
+            )
+
+            # Race the prompt against opencode's own permission-event stream
+            # instead of just awaiting it: nobody is watching this session
+            # interactively, so a pending "ask" must be surfaced back to the
+            # caller instead of sitting until timeout_seconds elapses.
+            send_task = asyncio.ensure_future(
+                send_opencode_prompt(base_url, current_session_id, agent, prompt, timeout_seconds)
+            )
+            permission_task = asyncio.ensure_future(
+                _wait_for_permission_event(current_session_id)
+            )
+            done, _pending = await asyncio.wait(
+                {send_task, permission_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if send_task not in done:
+                _pending_calls[current_session_id] = send_task
+                return _permission_required_result(current_session_id, permission_task.result())
+
+            permission_task.cancel()
+            result = await send_task
+        except _TRANSIENT_SERVER_ERRORS:
+            if attempt == 1:
+                raise
+            logger.exception(
+                "Lost connection to opencode serve for session %s; restarting and retrying once",
+                current_session_id,
+            )
+            if current_session_id is not None:
+                _evict_and_kill_session_backend(current_session_id)
+            continue
+
+        session_id = current_session_id
+        break
+
+    return _finalize_prompt_result(session_id, result)
+
+
+async def _answer_permission(
+    session_id: str, request_id: str, reply: str, message: str | None
+) -> dict[str, Any]:
+    if reply not in ("once", "always", "reject"):
+        raise ToolError(f"Invalid reply {reply!r}; expected 'once', 'always', or 'reject'")
+
+    cached = _session_state.get(session_id)
+    if cached is None:
+        raise ToolError(f"Unknown or expired session_id: {session_id}")
+    _, base_url, _ = cached
+
+    body: dict[str, Any] = {"response": reply}
+    if message:
+        body["message"] = message
+
+    async with httpx2.AsyncClient(timeout=ORCA_COMMAND_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            f"{base_url}/session/{session_id}/permissions/{request_id}",
+            json=body,
+        )
+
+    if response.is_error:
+        raise RuntimeError(
+            f"Failed to answer permission (status {response.status_code}):\n{response.text}"
+        )
+
+    send_task = _pending_calls.get(session_id)
+    if send_task is None:
+        return {"session_id": session_id, "status": "ok"}
+
+    # The prompt this permission was blocking may hit another "ask" before
+    # it finishes -- race it the same way run_opencode() does, so a chain of
+    # permission requests stays entirely between Claude and this tool.
+    permission_task = asyncio.ensure_future(_wait_for_permission_event(session_id))
+    done, _pending = await asyncio.wait(
+        {send_task, permission_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+
+    if send_task not in done:
+        return _permission_required_result(session_id, permission_task.result())
+
+    permission_task.cancel()
+    del _pending_calls[session_id]
+    return _finalize_prompt_result(session_id, await send_task)
+
+
+@mcp.tool()
+async def answer_permission(
+    session_id: str, request_id: str, reply: str, message: str | None = None
+) -> dict[str, Any]:
+    """
+    Resolve a pending OpenCode permission request (returned as
+    status="permission_required" by any OpenCode agent tool)
+    instead of leaving the underlying opencode session blocked waiting for
+    an interactive answer nobody will give it.
+
+    reply is "once" (allow this one time), "always" (allow and remember for
+    the rest of this session), or "reject" (deny). Returns the agent's final
+    result once resolved, or another status="permission_required" if the
+    resumed call hits a second pending permission.
+    """
+    try:
+        return await _answer_permission(session_id, request_id, reply, message)
+    except ToolError:
+        raise
+    except Exception as exc:
+        logger.exception("answer_permission() failed")
+        raise ToolError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

@@ -798,6 +798,147 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         for call in mock_ensure_backend.await_args_list:
             self.assertEqual(call.args[0], "ses_existing")
 
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_returns_permission_required_when_asked_before_prompt_completes(
+        self, mock_ensure_backend, mock_send_prompt
+    ):
+        # Nobody is watching interactively: a pending "ask" must be surfaced
+        # back to the caller instead of the call sitting until timeout.
+        mock_ensure_backend.return_value = ("http://x", "ses_perm_1")
+
+        async def hang_forever(*args, **kwargs):
+            await asyncio.sleep(3600)
+
+        mock_send_prompt.side_effect = hang_forever
+        server._get_permission_queue("ses_perm_1").put_nowait(
+            {"id": "perm_1", "permission": "bash", "patterns": ["rm *"]}
+        )
+
+        try:
+            result = await server.run_opencode(agent="tester", prompt="run it", session_id="ses_perm_1")
+
+            self.assertEqual(result["status"], "permission_required")
+            self.assertEqual(result["request_id"], "perm_1")
+            self.assertEqual(result["action"], "bash")
+            self.assertEqual(result["patterns"], ["rm *"])
+            self.assertIn("ses_perm_1", server._pending_calls)
+        finally:
+            server._pending_calls.pop("ses_perm_1").cancel()
+            server._permission_queues.pop("ses_perm_1", None)
+
+
+class EvictAndKillSessionBackendTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._session_state.clear()
+
+    @patch("server.os.killpg")
+    @patch("server.os.getpgid", return_value=1)
+    async def test_cancels_pending_call_and_clears_permission_queue(self, mock_getpgid, mock_killpg):
+        process = FakeProcess([], pid=1, returncode=None)
+        server._session_state["ses_evict"] = (process, "http://x", None)
+
+        async def hang_forever():
+            await asyncio.sleep(3600)
+
+        task = asyncio.ensure_future(hang_forever())
+        server._pending_calls["ses_evict"] = task
+        server._get_permission_queue("ses_evict")
+
+        server._evict_and_kill_session_backend("ses_evict")
+
+        self.assertNotIn("ses_evict", server._pending_calls)
+        self.assertNotIn("ses_evict", server._permission_queues)
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+class AnswerPermissionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._session_state.clear()
+
+    def tearDown(self):
+        server._session_state.pop("ses_ans", None)
+        server._pending_calls.pop("ses_ans", None)
+        server._permission_queues.pop("ses_ans", None)
+
+    async def test_unknown_session_raises(self):
+        with self.assertRaises(server.ToolError):
+            await server.answer_permission(session_id="nope", request_id="r1", reply="once")
+
+    async def test_invalid_reply_raises(self):
+        server._session_state["ses_ans"] = (None, "http://x", None)
+
+        with self.assertRaises(server.ToolError):
+            await server.answer_permission(session_id="ses_ans", request_id="r1", reply="bogus")
+
+    async def test_posts_reply_and_returns_ok_when_nothing_pending(self):
+        server._session_state["ses_ans"] = (None, "http://x", None)
+        mock_client = make_mock_client(FakeResponse(json_data={}))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            result = await server.answer_permission(
+                session_id="ses_ans", request_id="perm_1", reply="once"
+            )
+
+        self.assertEqual(result, {"session_id": "ses_ans", "status": "ok"})
+        mock_client.post.assert_awaited_once_with(
+            "http://x/session/ses_ans/permissions/perm_1",
+            json={"response": "once"},
+        )
+
+    async def test_reply_error_status_raises(self):
+        server._session_state["ses_ans"] = (None, "http://x", None)
+        mock_client = make_mock_client(FakeResponse(status_code=500, text="boom"))
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            with self.assertRaises(server.ToolError) as ctx:
+                await server.answer_permission(
+                    session_id="ses_ans", request_id="perm_1", reply="once"
+                )
+
+        self.assertIn("boom", str(ctx.exception))
+
+    async def test_resumes_pending_call_and_returns_final_result(self):
+        server._session_state["ses_ans"] = (None, "http://x", None)
+        mock_client = make_mock_client(FakeResponse(json_data={}))
+
+        async def eventually_done():
+            return {"info": {"finish": "stop"}, "parts": [{"type": "text", "text": "ok"}]}
+
+        server._pending_calls["ses_ans"] = asyncio.ensure_future(eventually_done())
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            result = await server.answer_permission(
+                session_id="ses_ans", request_id="perm_1", reply="once"
+            )
+
+        self.assertEqual(
+            result, {"session_id": "ses_ans", "response": "ok", "finish_reason": "stop"}
+        )
+        self.assertNotIn("ses_ans", server._pending_calls)
+
+    async def test_resumed_call_hits_another_permission_request(self):
+        server._session_state["ses_ans"] = (None, "http://x", None)
+        mock_client = make_mock_client(FakeResponse(json_data={}))
+
+        async def hang_forever():
+            await asyncio.sleep(3600)
+
+        server._pending_calls["ses_ans"] = asyncio.ensure_future(hang_forever())
+        server._get_permission_queue("ses_ans").put_nowait(
+            {"id": "perm_2", "permission": "edit", "patterns": ["*.env"]}
+        )
+
+        with patch("server.httpx2.AsyncClient", return_value=mock_client):
+            result = await server.answer_permission(
+                session_id="ses_ans", request_id="perm_1", reply="once"
+            )
+
+        self.assertEqual(result["status"], "permission_required")
+        self.assertEqual(result["request_id"], "perm_2")
+        server._pending_calls.pop("ses_ans").cancel()
+
 
 class RegisterAgentToolTests(unittest.IsolatedAsyncioTestCase):
     """
