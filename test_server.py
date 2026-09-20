@@ -330,101 +330,439 @@ class CreateSessionPaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(pane)
 
 
-class SessionServerEnvTests(unittest.TestCase):
-    def test_with_pane_overrides_identity_vars(self):
-        with patch.dict(os.environ, {"ORCA_PANE_KEY": "old", "ORCA_TAB_ID": "old", "OTHER": "z"}):
-            env = server._session_server_env(("term_1", "new_pane", "new_tab"))
+class SandboxExecEnvTests(unittest.TestCase):
+    def test_with_pane_sets_identity_vars(self):
+        with patch.dict(os.environ, {"ORCA_AGENT_LAUNCH_TOKEN": "tok", "ORCA_WORKTREE_ID": "wt"}):
+            env = server._sandbox_exec_env(("term_1", "new_pane", "new_tab"))
 
         self.assertEqual(env["ORCA_PANE_KEY"], "new_pane")
         self.assertEqual(env["ORCA_TAB_ID"], "new_tab")
         self.assertEqual(env["ORCA_TERMINAL_HANDLE"], "term_1")
-        self.assertEqual(env.get("OTHER"), "z")
+        self.assertEqual(env["ORCA_AGENT_LAUNCH_TOKEN"], "tok")
+        self.assertEqual(env["ORCA_WORKTREE_ID"], "wt")
 
-    def test_without_pane_strips_identity_vars(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ORCA_PANE_KEY": "old",
-                "ORCA_TAB_ID": "old",
-                "ORCA_TERMINAL_HANDLE": "old",
-                "OTHER": "z",
-            },
-        ):
-            env = server._session_server_env(None)
+    def test_without_pane_omits_identity_vars(self):
+        env = server._sandbox_exec_env(None)
 
         self.assertNotIn("ORCA_PANE_KEY", env)
         self.assertNotIn("ORCA_TAB_ID", env)
         self.assertNotIn("ORCA_TERMINAL_HANDLE", env)
-        self.assertEqual(env.get("OTHER"), "z")
+        self.assertNotIn("ORCA_AGENT_HOOK_PORT", env)
 
-    def test_leaves_hook_infrastructure_vars_untouched(self):
+    def test_forwards_hooks_dir_regardless_of_pane(self):
+        with patch.dict(os.environ, {"OPENCODE_CONFIG_DIR": "/x"}):
+            env_with = server._sandbox_exec_env(("h", "p", "t"))
+            env_without = server._sandbox_exec_env(None)
+
+        self.assertEqual(env_with.get("OPENCODE_CONFIG_DIR"), "/x")
+        self.assertEqual(env_without.get("OPENCODE_CONFIG_DIR"), "/x")
+
+
+class ReadOrcaHookEndpointTests(unittest.TestCase):
+    def test_none_when_nothing_set(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(server._read_orca_hook_endpoint())
+
+    def test_falls_back_to_env_vars(self):
         with patch.dict(
-            os.environ, {"ORCA_OPENCODE_CONFIG_DIR": "/x", "ORCA_AGENT_HOOK_PORT": "1"}
+            os.environ,
+            {"ORCA_AGENT_HOOK_PORT": "1234", "ORCA_AGENT_HOOK_TOKEN": "tok"},
+            clear=True,
         ):
-            env_with = server._session_server_env(("h", "p", "t"))
-            env_without = server._session_server_env(None)
+            self.assertEqual(server._read_orca_hook_endpoint(), ("1234", "tok", "", ""))
 
-        self.assertEqual(env_with.get("ORCA_OPENCODE_CONFIG_DIR"), "/x")
-        self.assertEqual(env_without.get("ORCA_OPENCODE_CONFIG_DIR"), "/x")
-        self.assertEqual(env_with.get("ORCA_AGENT_HOOK_PORT"), "1")
+    def test_falls_back_to_env_vars_including_env_and_version(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ORCA_AGENT_HOOK_PORT": "1234",
+                "ORCA_AGENT_HOOK_TOKEN": "tok",
+                "ORCA_AGENT_HOOK_ENV": "prod",
+                "ORCA_AGENT_HOOK_VERSION": "1.2.3",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                server._read_orca_hook_endpoint(), ("1234", "tok", "prod", "1.2.3")
+            )
+
+    def test_prefers_endpoint_file_over_env_vars(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            endpoint_path = os.path.join(tmpdir, "endpoint.env")
+            with open(endpoint_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "ORCA_AGENT_HOOK_PORT=5555\n"
+                    "ORCA_AGENT_HOOK_TOKEN=file_tok\n"
+                    "ORCA_AGENT_HOOK_ENV=file_env\n"
+                    "ORCA_AGENT_HOOK_VERSION=9.9.9\n"
+                )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "ORCA_AGENT_HOOK_ENDPOINT": endpoint_path,
+                    "ORCA_AGENT_HOOK_PORT": "1234",
+                    "ORCA_AGENT_HOOK_TOKEN": "env_tok",
+                },
+                clear=True,
+            ):
+                self.assertEqual(
+                    server._read_orca_hook_endpoint(),
+                    ("5555", "file_tok", "file_env", "9.9.9"),
+                )
+
+    def test_missing_endpoint_file_falls_back_to_env(self):
+        with patch.dict(
+            os.environ,
+            {
+                "ORCA_AGENT_HOOK_ENDPOINT": "/no/such/file",
+                "ORCA_AGENT_HOOK_PORT": "1234",
+                "ORCA_AGENT_HOOK_TOKEN": "tok",
+            },
+            clear=True,
+        ):
+            self.assertEqual(server._read_orca_hook_endpoint(), ("1234", "tok", "", ""))
+
+
+class PostOrcaStatusHookTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        server._session_hook_identity.clear()
+
+    def tearDown(self):
+        server._session_hook_identity.clear()
+
+    async def test_no_op_without_pane_identity(self):
+        with patch("server.httpx2.AsyncClient") as mock_client_cls:
+            await server._post_orca_status_hook("ses_1", "SessionBusy", {"sessionID": "ses_1"})
+
+        mock_client_cls.assert_not_called()
+
+    async def test_no_op_without_hook_coords(self):
+        server._session_hook_identity["ses_1"] = ("pane_1", "tab_1")
+
+        with patch("server._read_orca_hook_endpoint", return_value=None), \
+             patch("server.httpx2.AsyncClient") as mock_client_cls:
+            await server._post_orca_status_hook("ses_1", "SessionBusy", {"sessionID": "ses_1"})
+
+        mock_client_cls.assert_not_called()
+
+    async def test_posts_expected_body_and_headers(self):
+        server._session_hook_identity["ses_1"] = ("pane_1", "tab_1")
+        mock_client = make_mock_client(FakeResponse(json_data={}))
+
+        with patch(
+            "server._read_orca_hook_endpoint", return_value=("9999", "tok_abc", "prod", "1.0.0")
+        ), patch.dict(
+            os.environ,
+            {"ORCA_AGENT_LAUNCH_TOKEN": "launch_tok", "ORCA_WORKTREE_ID": "wt_1"},
+        ), patch("server.httpx2.AsyncClient", return_value=mock_client):
+            await server._post_orca_status_hook(
+                "ses_1", "PermissionRequest", {"sessionID": "ses_1", "id": "perm_1"}
+            )
+
+        mock_client.post.assert_awaited_once_with(
+            "http://127.0.0.1:9999/hook/opencode",
+            json={
+                "paneKey": "pane_1",
+                "launchToken": "launch_tok",
+                "tabId": "tab_1",
+                "worktreeId": "wt_1",
+                "env": "prod",
+                "version": "1.0.0",
+                "payload": {
+                    "hook_event_name": "PermissionRequest",
+                    "sessionID": "ses_1",
+                    "id": "perm_1",
+                },
+            },
+            headers={"X-Orca-Agent-Hook-Token": "tok_abc"},
+        )
+
+    async def test_post_failure_is_swallowed(self):
+        server._session_hook_identity["ses_1"] = ("pane_1", "tab_1")
+
+        with patch(
+            "server._read_orca_hook_endpoint", return_value=("9999", "tok_abc", "", "")
+        ), patch("server.httpx2.AsyncClient", side_effect=RuntimeError("boom")):
+            await server._post_orca_status_hook("ses_1", "SessionIdle", {})  # must not raise
+
+
+class GetAgentNetworkProfileTests(unittest.TestCase):
+    def test_defaults_to_balanced_when_no_definition_found(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile = server._get_agent_network_profile("nope", Path(tmpdir))
+
+        self.assertEqual(profile, "balanced")
+
+    def test_reads_declared_profile_from_project_local_definition(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            agent_dir = project_dir / ".opencode" / "agent"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "reviewer.md").write_text(
+                "---\ndescription: x\nnetwork: none\n---\nbody", encoding="utf-8"
+            )
+
+            profile = server._get_agent_network_profile("reviewer", project_dir)
+
+        self.assertEqual(profile, "none")
+
+    def test_invalid_value_falls_back_to_balanced(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            agent_dir = project_dir / ".opencode" / "agent"
+            agent_dir.mkdir(parents=True)
+            (agent_dir / "reviewer.md").write_text(
+                "---\ndescription: x\nnetwork: wide-open\n---\nbody", encoding="utf-8"
+            )
+
+            profile = server._get_agent_network_profile("reviewer", project_dir)
+
+        self.assertEqual(profile, "balanced")
+
+
+class InjectAgentDefinitionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pipes_content_over_stdin_to_sbx_exec(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "reviewer.md"
+            source_path.write_text("---\ndescription: x\n---\nbody", encoding="utf-8")
+
+            process = AsyncMock()
+            process.communicate = AsyncMock(return_value=(b"", b""))
+            process.returncode = 0
+
+            with patch(
+                "server.asyncio.create_subprocess_exec", new_callable=AsyncMock
+            ) as mock_exec:
+                mock_exec.return_value = process
+                await server._inject_agent_definition("sbx_1", "reviewer", source_path)
+
+            args = mock_exec.await_args.args
+            self.assertEqual(args[:4], ("sbx", "exec", "-i", "sbx_1"))
+            self.assertIn("reviewer.md", args[-1])
+            process.communicate.assert_awaited_once_with(
+                input="---\ndescription: x\n---\nbody".encode("utf-8")
+            )
+
+    async def test_nonzero_exit_is_logged_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "reviewer.md"
+            source_path.write_text("body", encoding="utf-8")
+
+            process = AsyncMock()
+            process.communicate = AsyncMock(return_value=(b"", b"permission denied"))
+            process.returncode = 1
+
+            with patch(
+                "server.asyncio.create_subprocess_exec", new_callable=AsyncMock
+            ) as mock_exec:
+                mock_exec.return_value = process
+                await server._inject_agent_definition("sbx_1", "reviewer", source_path)  # must not raise
+
+    async def test_exception_is_swallowed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "reviewer.md"
+            source_path.write_text("body", encoding="utf-8")
+
+            with patch(
+                "server.asyncio.create_subprocess_exec", side_effect=OSError("boom")
+            ):
+                await server._inject_agent_definition("sbx_1", "reviewer", source_path)  # must not raise
+
+
+class SbxInspectTests(unittest.IsolatedAsyncioTestCase):
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_finds_matching_sandbox(self, mock_run_command):
+        mock_run_command.return_value = (
+            0,
+            json.dumps({"sandboxes": [{"name": "orca-opencode-abc", "status": "running"}]}),
+            "",
+        )
+
+        sandbox = await server._sbx_inspect("orca-opencode-abc")
+
+        self.assertEqual(sandbox["status"], "running")
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_returns_none_when_not_found(self, mock_run_command):
+        mock_run_command.return_value = (0, json.dumps({"sandboxes": []}), "")
+
+        self.assertIsNone(await server._sbx_inspect("missing"))
+
+    @patch("server.run_command", new_callable=AsyncMock)
+    async def test_raises_on_command_failure(self, mock_run_command):
+        mock_run_command.return_value = (1, "", "daemon not running")
+
+        with self.assertRaises(RuntimeError):
+            await server._sbx_inspect("any")
+
+    @patch("server._sbx_inspect", new_callable=AsyncMock)
+    async def test_published_port_matches_by_sandbox_port(self, mock_inspect):
+        mock_inspect.return_value = {
+            "ports": [{"sandbox_port": 4096, "host_port": 49152}]
+        }
+
+        port = await server._sbx_published_port("orca-opencode-abc", 4096)
+
+        self.assertEqual(port, 49152)
+
+    @patch("server._sbx_inspect", new_callable=AsyncMock)
+    async def test_published_port_none_when_sandbox_missing(self, mock_inspect):
+        mock_inspect.return_value = None
+
+        self.assertIsNone(await server._sbx_published_port("missing", 4096))
 
 
 class SpawnSessionServerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_returns_process_and_base_url(self):
-        process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
+    def setUp(self):
+        patcher = patch("server._find_agent_definition", return_value=None)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        patcher = patch("server._inject_agent_definition", new_callable=AsyncMock)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        patcher = patch("server._get_agent_network_profile", return_value="balanced")
+        self.addCleanup(patcher.stop)
+        patcher.start()
 
-        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-            result_process, base_url = await server._spawn_session_server(Path("/tmp/p"), None)
+    async def test_injects_global_agent_definition_before_starting_serve(self):
+        process = FakeProcess([b"opencode server listening on http://0.0.0.0:4096\n"])
+        global_path = Path("/home/host-user/.config/opencode/agent/reviewer.md")
+
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_published_port", new_callable=AsyncMock, return_value=49152), \
+             patch("server._find_agent_definition", return_value=global_path), \
+             patch("server._inject_agent_definition", new_callable=AsyncMock) as mock_inject:
+            mock_run_command.return_value = (0, "", "")
+
+            _process, _base_url, sandbox_name = await server._spawn_session_server(
+                Path("/tmp/p"), None, "reviewer"
+            )
+
+        mock_inject.assert_awaited_once_with(sandbox_name, "reviewer", global_path)
+
+    async def test_skips_injection_for_project_local_definition(self):
+        process = FakeProcess([b"opencode server listening on http://0.0.0.0:4096\n"])
+        project_local_path = Path("/tmp/p/.opencode/agent/reviewer.md")
+
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_published_port", new_callable=AsyncMock, return_value=49152), \
+             patch("server._find_agent_definition", return_value=project_local_path), \
+             patch("server._inject_agent_definition", new_callable=AsyncMock) as mock_inject:
+            mock_run_command.return_value = (0, "", "")
+
+            await server._spawn_session_server(Path("/tmp/p"), None, "reviewer")
+
+        mock_inject.assert_not_awaited()
+
+    async def test_returns_process_base_url_and_sandbox_name(self):
+        process = FakeProcess([b"opencode server listening on http://0.0.0.0:4096\n"])
+
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_published_port", new_callable=AsyncMock) as mock_port:
+            mock_run_command.return_value = (0, "", "")
+            mock_port.return_value = 49152
+
+            result_process, base_url, sandbox_name = await server._spawn_session_server(
+                Path("/tmp/p"), None, "reviewer"
+            )
 
         self.assertIs(result_process, process)
-        self.assertEqual(base_url, "http://127.0.0.1:4096")
+        self.assertEqual(base_url, "http://127.0.0.1:49152")
+        self.assertTrue(sandbox_name.startswith("orca-opencode-"))
+
+    async def test_sbx_create_failure_raises(self):
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command:
+            mock_run_command.return_value = (1, "", "sbx: image pull failed")
+
+            with self.assertRaises(RuntimeError):
+                await server._spawn_session_server(Path("/tmp/p"), None, "reviewer")
 
     @patch("server.os.killpg")
     @patch("server.os.getpgid", return_value=1)
-    async def test_process_exits_without_listening_line_raises(self, mock_getpgid, mock_killpg):
+    async def test_process_exits_without_listening_line_raises_and_removes_sandbox(
+        self, mock_getpgid, mock_killpg
+    ):
         process = FakeProcess([b"some startup noise\n"], returncode=1)
 
-        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_remove_sandbox", new_callable=AsyncMock) as mock_remove:
+            mock_run_command.return_value = (0, "", "")
+
             with self.assertRaises(RuntimeError):
-                await server._spawn_session_server(Path("/tmp/p"), None)
+                await server._spawn_session_server(Path("/tmp/p"), None, "reviewer")
 
-    @patch("server.os.killpg")
-    @patch("server.os.getpgid", return_value=1)
-    async def test_exit_code_in_error_reflects_post_wait_value(self, mock_getpgid, mock_killpg):
-        # returncode starts as None (as it would be immediately after EOF,
-        # before asyncio has necessarily updated it) and FakeProcess.wait()
-        # is what finalizes it to -9 -- the error message must reflect that
-        # finalized value, not the pre-wait None.
-        process = FakeProcess([b"no listening line here\n"], returncode=None)
-
-        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
-            with self.assertRaises(RuntimeError) as ctx:
-                await server._spawn_session_server(Path("/tmp/p"), None)
-
-        self.assertIn("-9", str(ctx.exception))
-        self.assertNotIn("None", str(ctx.exception))
+        mock_remove.assert_awaited_once()
 
     @patch("server.os.killpg")
     @patch("server.os.getpgid", return_value=1)
     @patch("server.OPENCODE_SERVE_STARTUP_TIMEOUT_SECONDS", 0.05)
-    async def test_timeout_raises_and_kills_process(self, mock_getpgid, mock_killpg):
+    async def test_timeout_raises_kills_process_and_removes_sandbox(
+        self, mock_getpgid, mock_killpg
+    ):
         process = FakeProcess(hang=True)
 
-        with patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_remove_sandbox", new_callable=AsyncMock) as mock_remove:
+            mock_run_command.return_value = (0, "", "")
+
             with self.assertRaises(asyncio.TimeoutError):
-                await server._spawn_session_server(Path("/tmp/p"), None)
+                await server._spawn_session_server(Path("/tmp/p"), None, "reviewer")
 
         mock_killpg.assert_called_once()
+        mock_remove.assert_awaited_once()
 
-    async def test_passes_pane_env_to_subprocess(self):
-        process = FakeProcess([b"opencode server listening on http://127.0.0.1:4096\n"])
-        mock_exec = AsyncMock(return_value=process)
+    async def test_published_port_missing_raises_and_removes_sandbox(self):
+        process = FakeProcess([b"opencode server listening on http://0.0.0.0:4096\n"])
 
-        with patch("server.asyncio.create_subprocess_exec", new=mock_exec):
-            await server._spawn_session_server(Path("/tmp/p"), ("term_1", "pane_1", "tab_1"))
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_published_port", new_callable=AsyncMock) as mock_port, \
+             patch("server._sbx_remove_sandbox", new_callable=AsyncMock) as mock_remove, \
+             patch("server.os.killpg"), patch("server.os.getpgid", return_value=1):
+            mock_run_command.return_value = (0, "", "")
+            mock_port.return_value = None
 
-        _args, kwargs = mock_exec.call_args
-        self.assertEqual(kwargs["env"]["ORCA_PANE_KEY"], "pane_1")
+            with self.assertRaises(RuntimeError):
+                await server._spawn_session_server(Path("/tmp/p"), None, "reviewer")
+
+        mock_remove.assert_awaited_once()
+
+    async def test_deny_network_flag_added_for_none_profile(self):
+        process = FakeProcess([b"opencode server listening on http://0.0.0.0:4096\n"])
+
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)), \
+             patch("server._sbx_published_port", new_callable=AsyncMock, return_value=49152), \
+             patch("server._get_agent_network_profile", return_value="none"):
+            mock_run_command.return_value = (0, "", "")
+
+            await server._spawn_session_server(Path("/tmp/p"), None, "reviewer")
+
+        create_args = mock_run_command.await_args_list[0].args[0]
+        self.assertIn("--deny-network", create_args)
+        self.assertIn("**", create_args)
+
+    async def test_passes_pane_env_to_exec(self):
+        process = FakeProcess([b"opencode server listening on http://0.0.0.0:4096\n"])
+
+        with patch("server.run_command", new_callable=AsyncMock) as mock_run_command, \
+             patch("server.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as mock_exec, \
+             patch("server._sbx_published_port", new_callable=AsyncMock, return_value=49152):
+            mock_run_command.return_value = (0, "", "")
+
+            await server._spawn_session_server(
+                Path("/tmp/p"), ("term_1", "pane_1", "tab_1"), "reviewer"
+            )
+
+        exec_args = mock_exec.call_args.args
+        self.assertIn("-e", exec_args)
+        self.assertIn("ORCA_PANE_KEY=pane_1", exec_args)
 
 
 class AttachTerminalToSessionTests(unittest.IsolatedAsyncioTestCase):
@@ -448,6 +786,7 @@ class AttachTerminalToSessionTests(unittest.IsolatedAsyncioTestCase):
 class CreateSessionBackendTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         server._session_state.clear()
+        server._session_hook_identity.clear()
 
     @patch("server._attach_terminal_to_session", new_callable=AsyncMock)
     @patch("server.create_opencode_session", new_callable=AsyncMock)
@@ -458,7 +797,7 @@ class CreateSessionBackendTests(unittest.IsolatedAsyncioTestCase):
     ):
         process = FakeProcess([])
         mock_create_pane.return_value = ("term_1", "pane_1", "tab_1")
-        mock_spawn.return_value = (process, "http://x")
+        mock_spawn.return_value = (process, "http://x", "orca-opencode-abc")
         mock_create_session.return_value = "ses_new"
 
         base_url, session_id = await server._create_session_backend(
@@ -466,9 +805,14 @@ class CreateSessionBackendTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual((base_url, session_id), ("http://x", "ses_new"))
-        mock_spawn.assert_awaited_once_with(Path("/tmp/p"), ("term_1", "pane_1", "tab_1"))
+        mock_spawn.assert_awaited_once_with(
+            Path("/tmp/p"), ("term_1", "pane_1", "tab_1"), "reviewer"
+        )
         mock_attach.assert_awaited_once_with("term_1", "http://x", "ses_new")
-        self.assertEqual(server._session_state["ses_new"], (process, "http://x", "term_1"))
+        self.assertEqual(
+            server._session_state["ses_new"], ("orca-opencode-abc", "http://x", "term_1")
+        )
+        self.assertEqual(server._session_hook_identity["ses_new"], ("pane_1", "tab_1"))
 
     @patch("server._attach_terminal_to_session", new_callable=AsyncMock)
     @patch("server.create_opencode_session", new_callable=AsyncMock)
@@ -479,14 +823,17 @@ class CreateSessionBackendTests(unittest.IsolatedAsyncioTestCase):
     ):
         process = FakeProcess([])
         mock_create_pane.return_value = None
-        mock_spawn.return_value = (process, "http://x")
+        mock_spawn.return_value = (process, "http://x", "orca-opencode-abc")
         mock_create_session.return_value = "ses_new"
 
         await server._create_session_backend(None, "reviewer", Path("/tmp/p"))
 
-        mock_spawn.assert_awaited_once_with(Path("/tmp/p"), None)
+        mock_spawn.assert_awaited_once_with(Path("/tmp/p"), None, "reviewer")
         mock_attach.assert_not_awaited()
-        self.assertEqual(server._session_state["ses_new"], (process, "http://x", None))
+        self.assertEqual(
+            server._session_state["ses_new"], ("orca-opencode-abc", "http://x", None)
+        )
+        self.assertNotIn("ses_new", server._session_hook_identity)
 
     @patch("server._attach_terminal_to_session", new_callable=AsyncMock)
     @patch("server.create_opencode_session", new_callable=AsyncMock)
@@ -497,7 +844,7 @@ class CreateSessionBackendTests(unittest.IsolatedAsyncioTestCase):
     ):
         process = FakeProcess([])
         mock_create_pane.return_value = None
-        mock_spawn.return_value = (process, "http://x")
+        mock_spawn.return_value = (process, "http://x", "orca-opencode-abc")
 
         base_url, session_id = await server._create_session_backend(
             "ses_existing", "reviewer", Path("/tmp/p")
@@ -521,10 +868,13 @@ class EnsureSessionBackendTests(unittest.IsolatedAsyncioTestCase):
         mock_create_backend.assert_awaited_once_with(None, "reviewer", Path("/tmp/p"))
 
     @patch("server.run_command", new_callable=AsyncMock)
+    @patch("server._sbx_inspect", new_callable=AsyncMock)
     @patch("server._create_session_backend", new_callable=AsyncMock)
-    async def test_reuses_when_server_and_terminal_alive(self, mock_create_backend, mock_run_command):
-        process = FakeProcess([], returncode=None)
-        server._session_state["ses_1"] = (process, "http://x", "term_1")
+    async def test_reuses_when_server_and_terminal_alive(
+        self, mock_create_backend, mock_inspect, mock_run_command
+    ):
+        server._session_state["ses_1"] = ("orca-opencode-abc", "http://x", "term_1")
+        mock_inspect.return_value = {"name": "orca-opencode-abc", "status": "running"}
         mock_run_command.return_value = (0, "{}", "")
 
         result = await server.ensure_session_backend("ses_1", "reviewer", Path("/tmp/p"))
@@ -533,10 +883,13 @@ class EnsureSessionBackendTests(unittest.IsolatedAsyncioTestCase):
         mock_create_backend.assert_not_awaited()
 
     @patch("server.run_command", new_callable=AsyncMock)
+    @patch("server._sbx_inspect", new_callable=AsyncMock)
     @patch("server._create_session_backend", new_callable=AsyncMock)
-    async def test_recreates_when_server_dead(self, mock_create_backend, mock_run_command):
-        dead_process = FakeProcess([], returncode=0)
-        server._session_state["ses_1"] = (dead_process, "http://x", "term_1")
+    async def test_recreates_when_server_dead(
+        self, mock_create_backend, mock_inspect, mock_run_command
+    ):
+        server._session_state["ses_1"] = ("orca-opencode-abc", "http://x", "term_1")
+        mock_inspect.return_value = None
         mock_create_backend.return_value = ("http://y", "ses_1")
 
         result = await server.ensure_session_backend("ses_1", "reviewer", Path("/tmp/p"))
@@ -546,10 +899,13 @@ class EnsureSessionBackendTests(unittest.IsolatedAsyncioTestCase):
         mock_run_command.assert_not_awaited()  # server already dead, no need to check the terminal
 
     @patch("server.run_command", new_callable=AsyncMock)
+    @patch("server._sbx_inspect", new_callable=AsyncMock)
     @patch("server._create_session_backend", new_callable=AsyncMock)
-    async def test_recreates_when_terminal_gone(self, mock_create_backend, mock_run_command):
-        process = FakeProcess([], returncode=None)
-        server._session_state["ses_1"] = (process, "http://x", "term_1")
+    async def test_recreates_when_terminal_gone(
+        self, mock_create_backend, mock_inspect, mock_run_command
+    ):
+        server._session_state["ses_1"] = ("orca-opencode-abc", "http://x", "term_1")
+        mock_inspect.return_value = {"name": "orca-opencode-abc", "status": "running"}
         mock_run_command.return_value = (1, "", "not found")
         mock_create_backend.return_value = ("http://y", "ses_1")
 
@@ -558,15 +914,17 @@ class EnsureSessionBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, ("http://y", "ses_1"))
         mock_create_backend.assert_awaited_once_with("ses_1", "reviewer", Path("/tmp/p"))
 
+    @patch("server._sbx_inspect", new_callable=AsyncMock)
     @patch("server._create_session_backend", new_callable=AsyncMock)
-    async def test_concurrent_calls_do_not_double_create(self, mock_create_backend):
+    async def test_concurrent_calls_do_not_double_create(self, mock_create_backend, mock_inspect):
         call_count = 0
+        mock_inspect.return_value = {"name": "orca-opencode-abc", "status": "running"}
 
         async def fake_create_backend(session_id, agent, project_dir):
             nonlocal call_count
             call_count += 1
             await asyncio.sleep(0.01)
-            server._session_state[session_id] = (FakeProcess([], returncode=None), "http://x", None)
+            server._session_state[session_id] = ("orca-opencode-abc", "http://x", None)
             return "http://x", session_id
 
         mock_create_backend.side_effect = fake_create_backend
@@ -583,30 +941,27 @@ class KillOpencodeServersTests(unittest.TestCase):
     def setUp(self):
         server._session_state.clear()
 
-    @patch("server.os.killpg")
-    @patch("server.os.getpgid", return_value=42)
-    def test_kills_live_processes_only(self, mock_getpgid, mock_killpg):
-        live = FakeProcess([], pid=111, returncode=None)
-        dead = FakeProcess([], pid=222, returncode=0)
-        server._session_state["ses_a"] = (live, "http://x", "term_a")
-        server._session_state["ses_b"] = (dead, "http://y", "term_b")
+    @patch("server.subprocess.run")
+    def test_removes_every_tracked_sandbox(self, mock_run):
+        server._session_state["ses_a"] = ("orca-opencode-a", "http://x", "term_a")
+        server._session_state["ses_b"] = ("orca-opencode-b", "http://y", "term_b")
 
         server._kill_opencode_servers()
 
-        mock_getpgid.assert_called_once_with(111)
-        mock_killpg.assert_called_once_with(42, server.signal.SIGTERM)
+        called_names = {call.args[0][3] for call in mock_run.call_args_list}
+        self.assertEqual(called_names, {"orca-opencode-a", "orca-opencode-b"})
+        for call in mock_run.call_args_list:
+            self.assertEqual(call.args[0][:2], ["sbx", "rm"])
+            self.assertIn("--force", call.args[0])
 
-    @patch("server.os.killpg", side_effect=[Exception("boom"), None])
-    @patch("server.os.getpgid", return_value=42)
-    def test_exception_on_one_does_not_block_others(self, mock_getpgid, mock_killpg):
-        live1 = FakeProcess([], pid=111, returncode=None)
-        live2 = FakeProcess([], pid=222, returncode=None)
-        server._session_state["ses_c"] = (live1, "http://x", None)
-        server._session_state["ses_d"] = (live2, "http://y", None)
+    @patch("server.subprocess.run", side_effect=[Exception("boom"), None])
+    def test_exception_on_one_does_not_block_others(self, mock_run):
+        server._session_state["ses_c"] = ("orca-opencode-c", "http://x", None)
+        server._session_state["ses_d"] = ("orca-opencode-d", "http://y", None)
 
         server._kill_opencode_servers()  # must not raise
 
-        self.assertEqual(mock_killpg.call_count, 2)
+        self.assertEqual(mock_run.call_count, 2)
 
 
 class InstallTerminationCleanupTests(unittest.TestCase):
@@ -693,16 +1048,62 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
             "ses_existing", "reviewer", server.get_project_dir()
         )
 
+    @patch("server._sbx_remove_sandbox", new_callable=AsyncMock)
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
     @patch("server.ensure_session_backend", new_callable=AsyncMock)
-    async def test_error_in_info_raises(self, mock_ensure_backend, mock_send_prompt):
+    async def test_error_in_info_raises(
+        self, mock_ensure_backend, mock_send_prompt, mock_remove_sandbox
+    ):
         mock_ensure_backend.return_value = ("http://x", "ses_1")
         mock_send_prompt.return_value = {"info": {"error": {"message": "boom"}}, "parts": []}
+        server._session_state["ses_1"] = ("orca-opencode-abc", "http://x", None)
 
         with self.assertRaises(RuntimeError) as ctx:
             await server.run_opencode(agent="reviewer", prompt="do it")
 
         self.assertIn("boom", str(ctx.exception))
+        # An application-level error from OpenCode still means the run is
+        # finished -- the sandbox must be torn down despite the exception.
+        self.assertNotIn("ses_1", server._session_state)
+        mock_remove_sandbox.assert_awaited_once_with("orca-opencode-abc")
+
+    @patch("server._sbx_remove_sandbox", new_callable=AsyncMock)
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_successful_run_evicts_and_kills_sandbox(
+        self, mock_ensure_backend, mock_send_prompt, mock_remove_sandbox
+    ):
+        mock_ensure_backend.return_value = ("http://x", "ses_1")
+        mock_send_prompt.return_value = {
+            "info": {"finish": "stop"},
+            "parts": [{"type": "text", "text": "ok"}],
+        }
+        server._session_state["ses_1"] = ("orca-opencode-abc", "http://x", None)
+
+        await server.run_opencode(agent="reviewer", prompt="do it")
+
+        self.assertNotIn("ses_1", server._session_state)
+        mock_remove_sandbox.assert_awaited_once_with("orca-opencode-abc")
+
+    @patch("server._post_orca_status_hook", new_callable=AsyncMock)
+    @patch("server._sbx_remove_sandbox", new_callable=AsyncMock)
+    @patch("server.send_opencode_prompt", new_callable=AsyncMock)
+    @patch("server.ensure_session_backend", new_callable=AsyncMock)
+    async def test_posts_busy_then_idle_status_hooks(
+        self, mock_ensure_backend, mock_send_prompt, mock_remove_sandbox, mock_post_hook
+    ):
+        mock_ensure_backend.return_value = ("http://x", "ses_1")
+        mock_send_prompt.return_value = {
+            "info": {"finish": "stop"},
+            "parts": [{"type": "text", "text": "ok"}],
+        }
+
+        await server.run_opencode(agent="reviewer", prompt="do it")
+
+        self.assertEqual(
+            [call.args[:2] for call in mock_post_hook.await_args_list],
+            [("ses_1", "SessionBusy"), ("ses_1", "SessionIdle")],
+        )
 
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
     @patch("server.ensure_session_backend", new_callable=AsyncMock)
@@ -721,12 +1122,11 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["response"], "kept")
 
-    @patch("server.os.killpg")
-    @patch("server.os.getpgid", return_value=1)
+    @patch("server._sbx_remove_sandbox", new_callable=AsyncMock)
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
     @patch("server.ensure_session_backend", new_callable=AsyncMock)
     async def test_retries_once_after_transport_error(
-        self, mock_ensure_backend, mock_send_prompt, mock_getpgid, mock_killpg
+        self, mock_ensure_backend, mock_send_prompt, mock_remove_sandbox
     ):
         mock_ensure_backend.side_effect = [
             ("http://first", "ses_new"),
@@ -736,8 +1136,7 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
             httpx2.ConnectError("boom"),
             {"info": {"finish": "stop"}, "parts": [{"type": "text", "text": "ok"}]},
         ]
-        stale_process = FakeProcess([], pid=999, returncode=None)
-        server._session_state["ses_new"] = (stale_process, "http://first", None)
+        server._session_state["ses_new"] = ("orca-opencode-stale", "http://first", None)
 
         result = await server.run_opencode(agent="reviewer", prompt="do it")
 
@@ -745,9 +1144,9 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_ensure_backend.await_count, 2)
         self.assertEqual(mock_send_prompt.await_count, 2)
         self.assertNotIn("ses_new", server._session_state)
-        # The stale server must actually be killed, not just forgotten --
-        # otherwise it leaks as an untracked, unkillable orphan.
-        mock_killpg.assert_called_once_with(1, server.signal.SIGTERM)
+        # The stale sandbox must actually be removed, not just forgotten --
+        # otherwise it leaks as an untracked, unkillable orphan container.
+        mock_remove_sandbox.assert_awaited_once_with("orca-opencode-stale")
         # The second attempt must reuse the session_id learned from the first
         # (not start over with session_id=None), so history isn't lost.
         second_call_args = mock_ensure_backend.await_args_list[1].args
@@ -798,10 +1197,11 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         for call in mock_ensure_backend.await_args_list:
             self.assertEqual(call.args[0], "ses_existing")
 
+    @patch("server._post_orca_status_hook", new_callable=AsyncMock)
     @patch("server.send_opencode_prompt", new_callable=AsyncMock)
     @patch("server.ensure_session_backend", new_callable=AsyncMock)
     async def test_returns_permission_required_when_asked_before_prompt_completes(
-        self, mock_ensure_backend, mock_send_prompt
+        self, mock_ensure_backend, mock_send_prompt, mock_post_hook
     ):
         # Nobody is watching interactively: a pending "ask" must be surfaced
         # back to the caller instead of the call sitting until timeout.
@@ -814,6 +1214,7 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
         server._get_permission_queue("ses_perm_1").put_nowait(
             {"id": "perm_1", "permission": "bash", "patterns": ["rm *"]}
         )
+        server._session_state["ses_perm_1"] = ("orca-opencode-abc", "http://x", None)
 
         try:
             result = await server.run_opencode(agent="tester", prompt="run it", session_id="ses_perm_1")
@@ -823,20 +1224,27 @@ class RunOpencodeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result["action"], "bash")
             self.assertEqual(result["patterns"], ["rm *"])
             self.assertIn("ses_perm_1", server._pending_calls)
+            # A pending permission must keep the sandbox alive for the
+            # follow-up answer_permission() call.
+            self.assertIn("ses_perm_1", server._session_state)
+            self.assertEqual(
+                [call.args[:2] for call in mock_post_hook.await_args_list],
+                [("ses_perm_1", "SessionBusy"), ("ses_perm_1", "PermissionRequest")],
+            )
         finally:
             server._pending_calls.pop("ses_perm_1").cancel()
             server._permission_queues.pop("ses_perm_1", None)
+            server._session_state.pop("ses_perm_1", None)
 
 
 class EvictAndKillSessionBackendTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         server._session_state.clear()
 
-    @patch("server.os.killpg")
-    @patch("server.os.getpgid", return_value=1)
-    async def test_cancels_pending_call_and_clears_permission_queue(self, mock_getpgid, mock_killpg):
-        process = FakeProcess([], pid=1, returncode=None)
-        server._session_state["ses_evict"] = (process, "http://x", None)
+    @patch("server._sbx_remove_sandbox", new_callable=AsyncMock)
+    async def test_cancels_pending_call_and_clears_permission_queue(self, mock_remove_sandbox):
+        server._session_state["ses_evict"] = ("orca-opencode-abc", "http://x", None)
+        server._session_hook_identity["ses_evict"] = ("pane_1", "tab_1")
 
         async def hang_forever():
             await asyncio.sleep(3600)
@@ -845,10 +1253,12 @@ class EvictAndKillSessionBackendTests(unittest.IsolatedAsyncioTestCase):
         server._pending_calls["ses_evict"] = task
         server._get_permission_queue("ses_evict")
 
-        server._evict_and_kill_session_backend("ses_evict")
+        await server._evict_and_kill_session_backend("ses_evict")
 
         self.assertNotIn("ses_evict", server._pending_calls)
         self.assertNotIn("ses_evict", server._permission_queues)
+        self.assertNotIn("ses_evict", server._session_hook_identity)
+        mock_remove_sandbox.assert_awaited_once_with("orca-opencode-abc")
         with self.assertRaises(asyncio.CancelledError):
             await task
 
@@ -899,8 +1309,12 @@ class AnswerPermissionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("boom", str(ctx.exception))
 
-    async def test_resumes_pending_call_and_returns_final_result(self):
-        server._session_state["ses_ans"] = (None, "http://x", None)
+    @patch("server._post_orca_status_hook", new_callable=AsyncMock)
+    @patch("server._sbx_remove_sandbox", new_callable=AsyncMock)
+    async def test_resumes_pending_call_and_returns_final_result(
+        self, mock_remove_sandbox, mock_post_hook
+    ):
+        server._session_state["ses_ans"] = ("orca-opencode-abc", "http://x", None)
         mock_client = make_mock_client(FakeResponse(json_data={}))
 
         async def eventually_done():
@@ -917,8 +1331,17 @@ class AnswerPermissionTests(unittest.IsolatedAsyncioTestCase):
             result, {"session_id": "ses_ans", "response": "ok", "finish_reason": "stop"}
         )
         self.assertNotIn("ses_ans", server._pending_calls)
+        # A finished run must tear its sandbox down instead of leaving it
+        # running until the whole MCP process exits.
+        self.assertNotIn("ses_ans", server._session_state)
+        mock_remove_sandbox.assert_awaited_once_with("orca-opencode-abc")
+        self.assertEqual(
+            [call.args[:2] for call in mock_post_hook.await_args_list],
+            [("ses_ans", "SessionBusy"), ("ses_ans", "SessionIdle")],
+        )
 
-    async def test_resumed_call_hits_another_permission_request(self):
+    @patch("server._post_orca_status_hook", new_callable=AsyncMock)
+    async def test_resumed_call_hits_another_permission_request(self, mock_post_hook):
         server._session_state["ses_ans"] = (None, "http://x", None)
         mock_client = make_mock_client(FakeResponse(json_data={}))
 
@@ -937,6 +1360,13 @@ class AnswerPermissionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "permission_required")
         self.assertEqual(result["request_id"], "perm_2")
+        # A chained permission request must not tear the sandbox down --
+        # the session is still needed for the next answer_permission call.
+        self.assertIn("ses_ans", server._session_state)
+        self.assertEqual(
+            [call.args[:2] for call in mock_post_hook.await_args_list],
+            [("ses_ans", "SessionBusy"), ("ses_ans", "PermissionRequest")],
+        )
         server._pending_calls.pop("ses_ans").cancel()
 
 

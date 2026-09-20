@@ -6,6 +6,8 @@ import os
 import re
 import shlex
 import signal
+import subprocess
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -173,24 +175,45 @@ def parse_json_output(output: str) -> dict[str, Any]:
 #
 # Architecture:
 #
-#     MCP  --HTTP/JSON-->  opencode serve  (data channel, drives the run)
+#     MCP  --HTTP/JSON-->  opencode serve  (data channel, drives the run),
+#                          running inside a dedicated `sbx` (Docker Sandboxes)
+#                          sandbox rather than as a native host process
 #     MCP  --orca CLI-->   Orca terminal running `opencode attach` (visibility
 #                          channel only -- never read back by the MCP)
 #
 # The MCP never scrapes terminal output for opencode's own responses anymore:
-# `opencode serve` gives structured JSON directly.
+# `opencode serve` gives structured JSON directly. Its HTTP port is published
+# to the host by `sbx`, so `base_url` is a plain http://127.0.0.1:<port> from
+# the MCP's point of view regardless of where opencode actually runs.
 # ---------------------------------------------------------------------------
 
 OPENCODE_SERVE_STARTUP_TIMEOUT_SECONDS = 15
 OPENCODE_PROMPT_TIMEOUT_SECONDS = 900
+SBX_COMMAND_TIMEOUT_SECONDS = 60
+
+# Fixed port opencode serve binds to *inside* the sandbox. Each sandbox is
+# its own network namespace, so this never collides across sessions -- only
+# the host-side published port (resolved via `sbx ls --json`) needs to be
+# unique, and `sbx` picks that one itself.
+SBX_OPENCODE_CONTAINER_PORT = 4096
 
 _LISTENING_URL_RE = re.compile(r"listening on (http://\S+)")
 
-# session_id -> (process, base_url, terminal_handle_or_None). Each session
-# gets its own dedicated opencode serve process (see _create_session_pane /
-# _session_server_env below) so its busy/idle/waiting status can be attributed
-# to its own Orca terminal instead of a shared server with no single owner.
-_session_state: dict[str, tuple[asyncio.subprocess.Process, str, str | None]] = {}
+# session_id -> (sandbox_name, base_url, terminal_handle_or_None). Each
+# session gets its own dedicated sbx sandbox running opencode serve (see
+# _create_session_pane / _sandbox_exec_env below) so its busy/idle/waiting
+# status can be attributed to its own Orca terminal instead of a shared
+# server with no single owner, and so one session's sandbox can never affect
+# another's filesystem or network isolation.
+_session_state: dict[str, tuple[str, str, str | None]] = {}
+
+# session_id -> (pane_key, tab_id), the identity Orca's hook HTTP server
+# uses to route a status update to the right terminal pane (see post() in
+# orca-opencode-status.js). Populated alongside _session_state whenever a
+# pane was actually created; kept separate from it since most
+# _session_state consumers only care about the terminal handle, not this
+# hook-routing identity.
+_session_hook_identity: dict[str, tuple[str, str]] = {}
 
 # session_id -> lock, so two concurrent calls sharing a session_id don't each
 # decide "no backend yet" and spawn a duplicate server/terminal. Lazily
@@ -286,43 +309,51 @@ async def _drain_stream(stream: asyncio.StreamReader) -> None:
 _TRANSIENT_SERVER_ERRORS = (httpx2.NetworkError, httpx2.ConnectTimeout)
 
 
-def _evict_and_kill_session_backend(session_id: str) -> None:
-    """Stop tracking a session's server that failed to respond, and actually
-    kill it so it doesn't leak as an untracked, unkillable orphan process."""
+async def _sbx_remove_sandbox(sandbox_name: str) -> None:
+    """Best-effort: tear down a session's sandbox and everything running
+    inside it (opencode serve, the hook bridge). Never raises."""
+    try:
+        returncode, stdout, stderr = await run_command(
+            ["sbx", "rm", "--force", sandbox_name], timeout=SBX_COMMAND_TIMEOUT_SECONDS
+        )
+        if returncode != 0:
+            logger.warning("sbx rm failed for sandbox %s: %s", sandbox_name, stderr or stdout)
+    except Exception:
+        logger.exception("Failed to remove sandbox %s", sandbox_name)
+
+
+async def _evict_and_kill_session_backend(session_id: str) -> None:
+    """Stop tracking a session's sandbox that failed to respond, and actually
+    remove it so it doesn't leak as an untracked, unkillable orphan container."""
     cached = _session_state.pop(session_id, None)
 
     pending_task = _pending_calls.pop(session_id, None)
     if pending_task is not None:
         pending_task.cancel()
     _permission_queues.pop(session_id, None)
+    _session_hook_identity.pop(session_id, None)
 
     if cached is None:
         return
 
-    process, _base_url, _handle = cached
-
-    if process.returncode is not None:
-        return
-
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except Exception:
-        logger.exception("Failed to terminate unresponsive opencode serve process %s", process.pid)
+    sandbox_name, _base_url, _handle = cached
+    await _sbx_remove_sandbox(sandbox_name)
 
 
 def _kill_opencode_servers() -> None:
-    """Best-effort synchronous cleanup, registered with atexit."""
-    for process, _base_url, _handle in _session_state.values():
-        if process.returncode is not None:
-            continue
+    """Best-effort synchronous cleanup, registered with atexit. Runs outside
+    the asyncio loop (atexit / a signal handler), so `sbx rm` is invoked as a
+    plain blocking subprocess rather than through run_command."""
+    for sandbox_name, _base_url, _handle in _session_state.values():
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+            subprocess.run(
+                ["sbx", "rm", "--force", sandbox_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=SBX_COMMAND_TIMEOUT_SECONDS,
+            )
         except Exception:
-            logger.exception("Failed to terminate opencode serve process %s", process.pid)
+            logger.exception("Failed to remove sandbox %s", sandbox_name)
 
 
 atexit.register(_kill_opencode_servers)
@@ -396,22 +427,190 @@ async def _create_session_pane(agent: str, project_dir: Path) -> tuple[str, str,
         return None
 
 
-def _session_server_env(pane: tuple[str, str, str] | None) -> dict[str, str]:
+def _sbx_sandbox_name() -> str:
+    return f"orca-opencode-{uuid.uuid4().hex[:12]}"
+
+
+def _find_agent_definition(agent: str, project_dir: Path) -> Path | None:
+    """Same precedence as discover_agents(): a project-local definition
+    overrides the global one of the same name."""
+    project_local = project_dir / ".opencode" / "agent" / f"{agent}.md"
+    if project_local.is_file():
+        return project_local
+    global_file = Path.home() / ".config" / "opencode" / "agent" / f"{agent}.md"
+    if global_file.is_file():
+        return global_file
+    return None
+
+
+def _get_agent_network_profile(agent: str, project_dir: Path) -> str:
     """
-    Env for a session's dedicated opencode serve process. The pane-identity
-    vars are always removed first. If `pane` (handle, pane_key, tab_id) is
-    given, they're re-set to point at that terminal, so opencode's Orca
-    status-hook plugin (loaded via ORCA_OPENCODE_CONFIG_DIR, left untouched)
-    attributes busy/idle/waiting status to it. Otherwise they stay stripped so
-    nothing is misattributed to whatever pane this MCP process itself
-    inherited (e.g. its own coordinator terminal).
+    Reads the `network:` frontmatter key (see .opencode/agent/*.md) an agent
+    declares for its sandbox: "balanced" (default; inherits whatever global
+    sbx network policy is already configured on this machine) or "none"
+    (deny all outbound traffic for this sandbox specifically).
     """
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key
-        not in ("ORCA_PANE_KEY", "ORCA_TAB_ID", "ORCA_TERMINAL_HANDLE", "ORCA_AGENT_LAUNCH_TOKEN")
+    path = _find_agent_definition(agent, project_dir)
+    if path is None:
+        return "balanced"
+    frontmatter = _parse_agent_frontmatter(path)
+    if frontmatter is None:
+        return "balanced"
+    profile = frontmatter.get("network")
+    return profile if profile in ("balanced", "none") else "balanced"
+
+
+async def _inject_agent_definition(sandbox_name: str, agent: str, source_path: Path) -> None:
+    """
+    A sandboxed opencode only ever sees <project_dir>/.opencode/agent (it is
+    bind-mounted into the sandbox at the same path) -- it cannot resolve the
+    host's global ~/.config/opencode/agent, whose location depends on a
+    $HOME that doesn't exist inside the sandbox's own filesystem. If this
+    agent is only defined globally, write its definition straight into the
+    sandbox's own filesystem (never onto the host project) via `sbx exec`,
+    piping the content over stdin -- no temp file, no project-local copy.
+    Best effort: logs and continues on failure rather than blocking sandbox
+    creation; a missing agent definition surfaces as a clear error from
+    opencode itself on the next prompt instead.
+    """
+    try:
+        content = source_path.read_text(encoding="utf-8")
+        process = await asyncio.create_subprocess_exec(
+            "sbx", "exec", "-i", sandbox_name, "sh", "-c",
+            f'mkdir -p "$HOME/.config/opencode/agent" && '
+            f'cat > "$HOME/.config/opencode/agent/{agent}.md"',
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _stdout, stderr = await process.communicate(input=content.encode("utf-8"))
+        if process.returncode != 0:
+            logger.warning(
+                "Failed to inject agent definition for %s into sandbox %s: %s",
+                agent, sandbox_name, stderr.decode(errors="replace"),
+            )
+    except OSError:
+        logger.exception("Failed to inject agent definition for %s into sandbox %s", agent, sandbox_name)
+
+
+def _read_orca_hook_endpoint() -> tuple[str, str, str, str] | None:
+    """
+    Best-effort resolution of Orca's local hook-server coordinates (port,
+    token, env, version), mirroring resolveHookCoords() in the
+    orca-opencode-status plugin: prefer the on-disk endpoint file
+    (ORCA_AGENT_HOOK_ENDPOINT), falling back to the ORCA_AGENT_HOOK_* env
+    vars. Used by _post_orca_status_hook to replicate that plugin's own
+    posts from the host side -- see its docstring for why the plugin can no
+    longer do this itself now that opencode runs inside an sbx sandbox.
+    """
+    port = None
+    token = None
+    env_name = None
+    version = None
+
+    endpoint_path = os.environ.get("ORCA_AGENT_HOOK_ENDPOINT")
+    if endpoint_path:
+        try:
+            for line in Path(endpoint_path).read_text(encoding="utf-8").splitlines():
+                match = re.match(r"^(?:set\s+)?([A-Z0-9_]+)=(.*)$", line)
+                if not match:
+                    continue
+                key, value = match.group(1), match.group(2).rstrip("\r")
+                if key == "ORCA_AGENT_HOOK_PORT":
+                    port = value
+                elif key == "ORCA_AGENT_HOOK_TOKEN":
+                    token = value
+                elif key == "ORCA_AGENT_HOOK_ENV":
+                    env_name = value
+                elif key == "ORCA_AGENT_HOOK_VERSION":
+                    version = value
+        except OSError:
+            pass
+
+    port = port or os.environ.get("ORCA_AGENT_HOOK_PORT")
+    token = token or os.environ.get("ORCA_AGENT_HOOK_TOKEN")
+    env_name = env_name or os.environ.get("ORCA_AGENT_HOOK_ENV") or ""
+    version = version or os.environ.get("ORCA_AGENT_HOOK_VERSION") or ""
+
+    if not port or not token:
+        return None
+    return port, token, env_name, version
+
+
+ORCA_HOOK_POST_TIMEOUT_SECONDS = 2.0
+
+
+async def _post_orca_status_hook(
+    session_id: str, hook_event_name: str, properties: dict[str, Any] | None = None
+) -> None:
+    """
+    Best-effort, never raises: posts a busy/waiting/idle status update to
+    Orca's hook HTTP server on this session's behalf, replicating post() in
+    the orca-opencode-status plugin (see resolveHookCoords()/post() in
+    orca-opencode-status.js). The plugin normally does this itself from
+    inside opencode, but it cannot anymore now that opencode runs inside an
+    sbx sandbox: sbx's network policy blocks a sandbox from ever reaching
+    the host's own loopback (confirmed -- even host.docker.internal is
+    rejected with "blocked by network policy: domain localhost"), so the
+    plugin's own http://127.0.0.1:<hook_port> POST can never land. This MCP
+    server runs on the host and has no such restriction, so it posts on the
+    plugin's behalf instead, using the identity captured when this
+    session's terminal pane was created (_session_hook_identity). This only
+    covers the busy/waiting/idle transitions tied to actual MCP tool-call
+    boundaries -- not the plugin's own finer-grained child-session and
+    streaming message-preview behavior.
+    """
+    hook_identity = _session_hook_identity.get(session_id)
+    if hook_identity is None:
+        return
+    pane_key, tab_id = hook_identity
+
+    coords = _read_orca_hook_endpoint()
+    if coords is None:
+        return
+    port, token, env_name, version = coords
+
+    body = {
+        "paneKey": pane_key,
+        "launchToken": os.environ.get("ORCA_AGENT_LAUNCH_TOKEN", ""),
+        "tabId": tab_id,
+        "worktreeId": os.environ.get("ORCA_WORKTREE_ID", ""),
+        "env": env_name,
+        "version": version,
+        "payload": {"hook_event_name": hook_event_name, **(properties or {})},
     }
+
+    try:
+        async with httpx2.AsyncClient(timeout=ORCA_HOOK_POST_TIMEOUT_SECONDS) as client:
+            await client.post(
+                f"http://127.0.0.1:{port}/hook/opencode",
+                json=body,
+                headers={"X-Orca-Agent-Hook-Token": token},
+            )
+    except Exception:
+        logger.exception(
+            "Failed to post %s status hook for session %s", hook_event_name, session_id
+        )
+
+
+def _sandbox_exec_env(pane: tuple[str, str, str] | None) -> dict[str, str]:
+    """
+    Explicit env vars forwarded into the sandbox for `opencode serve`. Unlike
+    the native-process world this replaces, an isolated `sbx exec` doesn't
+    need the whole host environment preserved-and-scrubbed -- only the small
+    set of ORCA_*/OPENCODE_CONFIG_DIR values other plugins under that config
+    dir may still read. The Orca status-hook plugin's own hook coordinates
+    (ORCA_AGENT_HOOK_PORT/TOKEN) are deliberately NOT forwarded here anymore:
+    sbx's network policy blocks a sandbox from ever reaching the host's own
+    loopback, so the plugin could never successfully post from inside the
+    sandbox regardless -- see _post_orca_status_hook, which replicates those
+    posts from the host side instead.
+    """
+    env: dict[str, str] = {}
+
+    hooks_dir = os.environ.get("OPENCODE_CONFIG_DIR")
+    if hooks_dir:
+        env["OPENCODE_CONFIG_DIR"] = hooks_dir
 
     if pane is not None:
         handle, pane_key, tab_id = pane
@@ -419,21 +618,92 @@ def _session_server_env(pane: tuple[str, str, str] | None) -> dict[str, str]:
         env["ORCA_TAB_ID"] = tab_id
         env["ORCA_TERMINAL_HANDLE"] = handle
 
+        for key in ("ORCA_AGENT_LAUNCH_TOKEN", "ORCA_WORKTREE_ID"):
+            value = os.environ.get(key)
+            if value:
+                env[key] = value
+
     return env
 
 
+async def _sbx_inspect(sandbox_name: str) -> dict[str, Any] | None:
+    """Returns this sandbox's `sbx ls --json` entry, or None if it doesn't
+    exist (removed, never created, or sandboxd doesn't know about it)."""
+    returncode, stdout, stderr = await run_command(
+        ["sbx", "ls", "--json"], timeout=SBX_COMMAND_TIMEOUT_SECONDS
+    )
+    if returncode != 0:
+        raise RuntimeError(f"sbx ls failed:\n{stderr or stdout}")
+
+    data = parse_json_output(stdout)
+    for sandbox in data.get("sandboxes", []) or []:
+        if isinstance(sandbox, dict) and sandbox.get("name") == sandbox_name:
+            return sandbox
+    return None
+
+
+async def _sbx_published_port(sandbox_name: str, container_port: int) -> int | None:
+    sandbox = await _sbx_inspect(sandbox_name)
+    if sandbox is None:
+        return None
+    for port in sandbox.get("ports", []) or []:
+        if isinstance(port, dict) and port.get("sandbox_port") == container_port:
+            return port.get("host_port")
+    return None
+
+
 async def _spawn_session_server(
-    project_dir: Path, pane: tuple[str, str, str] | None
-) -> tuple[asyncio.subprocess.Process, str]:
+    project_dir: Path, pane: tuple[str, str, str] | None, agent: str
+) -> tuple[asyncio.subprocess.Process, str, str]:
+    """
+    Creates a dedicated sbx sandbox for this session and starts
+    `opencode serve` inside it. Returns (exec_process, base_url,
+    sandbox_name).
+
+    `exec_process` wraps the `sbx exec -d ... opencode serve` invocation
+    itself, kept only so its stdout can be drained for the process lifetime
+    (see _drain_stream below) -- it is NOT used to determine liveness.
+    Unlike a native subprocess, `sbx exec -d` stays attached and streams the
+    child's output for as long as it runs rather than detaching the CLI
+    itself, so ensure_session_backend asks sbx directly (`sbx ls --json`)
+    instead of checking this process's returncode.
+    """
+    sandbox_name = _sbx_sandbox_name()
+    agent_definition = _find_agent_definition(agent, project_dir)
+    network_profile = _get_agent_network_profile(agent, project_dir)
+
+    create_args = ["sbx", "create", "opencode", str(project_dir)]
+    hooks_dir = os.environ.get("OPENCODE_CONFIG_DIR")
+    if hooks_dir:
+        create_args.append(f"{hooks_dir}:ro")
+    create_args += [
+        "--name", sandbox_name,
+        "--publish", str(SBX_OPENCODE_CONTAINER_PORT),
+        "--quiet",
+    ]
+    if network_profile == "none":
+        create_args += ["--deny-network", "**"]
+
+    returncode, stdout, stderr = await run_command(create_args, timeout=SBX_COMMAND_TIMEOUT_SECONDS)
+    if returncode != 0:
+        raise RuntimeError(f"sbx create failed for sandbox {sandbox_name}:\n{stderr or stdout}")
+
+    project_local = project_dir / ".opencode" / "agent" / f"{agent}.md"
+    if agent_definition is not None and agent_definition != project_local:
+        await _inject_agent_definition(sandbox_name, agent, agent_definition)
+
+    exec_env = _sandbox_exec_env(pane)
+    exec_args = ["sbx", "exec", "-d"]
+    for key, value in exec_env.items():
+        exec_args += ["-e", f"{key}={value}"]
+    exec_args += [
+        sandbox_name, "opencode", "serve",
+        "--hostname", "0.0.0.0",
+        "--port", str(SBX_OPENCODE_CONTAINER_PORT),
+    ]
+
     process = await asyncio.create_subprocess_exec(
-        "opencode",
-        "serve",
-        "--port",
-        "0",
-        "--hostname",
-        "127.0.0.1",
-        cwd=str(project_dir),
-        env=_session_server_env(pane),
+        *exec_args,
         stdout=asyncio.subprocess.PIPE,
         # Merged into stdout: we don't know in advance which stream carries
         # the startup banner, and only one stream needs draining afterwards.
@@ -441,7 +711,7 @@ async def _spawn_session_server(
         start_new_session=True,
     )
 
-    async def read_until_listening() -> str:
+    async def read_until_listening() -> None:
         while True:
             line = await process.stdout.readline()
 
@@ -455,26 +725,30 @@ async def _spawn_session_server(
                     f"(exit code {process.returncode})"
                 )
 
-            match = _LISTENING_URL_RE.search(line.decode(errors="replace"))
-
-            if match:
-                return match.group(1)
+            if _LISTENING_URL_RE.search(line.decode(errors="replace")):
+                return
 
     try:
-        base_url = await asyncio.wait_for(
+        await asyncio.wait_for(
             read_until_listening(), timeout=OPENCODE_SERVE_STARTUP_TIMEOUT_SECONDS
         )
+        host_port = await _sbx_published_port(sandbox_name, SBX_OPENCODE_CONTAINER_PORT)
+        if host_port is None:
+            raise RuntimeError(f"sbx did not publish a host port for sandbox {sandbox_name}")
     except (asyncio.TimeoutError, RuntimeError):
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
         except ProcessLookupError:
             pass
         await process.wait()
+        await _sbx_remove_sandbox(sandbox_name)
         raise
+
+    base_url = f"http://127.0.0.1:{host_port}"
 
     _spawn_background_task(_drain_stream(process.stdout))
 
-    return process, base_url
+    return process, base_url, sandbox_name
 
 
 async def _attach_terminal_to_session(handle: str, base_url: str, session_id: str) -> None:
@@ -506,13 +780,15 @@ async def _create_session_backend(
     session_id: str | None, agent: str, project_dir: Path
 ) -> tuple[str, str]:
     pane = await _create_session_pane(agent, project_dir)
-    process, base_url = await _spawn_session_server(project_dir, pane)
+    _process, base_url, sandbox_name = await _spawn_session_server(project_dir, pane, agent)
 
     if session_id is None:
         session_id = await create_opencode_session(base_url, title=f"orca-bridge {agent}")
 
     handle = pane[0] if pane is not None else None
-    _session_state[session_id] = (process, base_url, handle)
+    _session_state[session_id] = (sandbox_name, base_url, handle)
+    if pane is not None:
+        _session_hook_identity[session_id] = (pane[1], pane[2])
     _spawn_background_task(_watch_permission_events(session_id, base_url))
 
     if handle is not None:
@@ -524,7 +800,7 @@ async def _create_session_backend(
 async def ensure_session_backend(
     session_id: str | None, agent: str, project_dir: Path
 ) -> tuple[str, str]:
-    """Reuse this session's dedicated server/terminal if both are still
+    """Reuse this session's dedicated sandbox/terminal if both are still
     alive; otherwise (re)create them, preserving the session_id."""
     if session_id is None:
         return await _create_session_backend(None, agent, project_dir)
@@ -533,8 +809,9 @@ async def ensure_session_backend(
         cached = _session_state.get(session_id)
 
         if cached is not None:
-            process, base_url, handle = cached
-            server_alive = process.returncode is None
+            sandbox_name, base_url, handle = cached
+            sandbox = await _sbx_inspect(sandbox_name)
+            server_alive = sandbox is not None and sandbox.get("status") == "running"
             terminal_alive = True
 
             if server_alive and handle is not None:
@@ -675,6 +952,9 @@ async def run_opencode(
             base_url, current_session_id = await ensure_session_backend(
                 current_session_id, agent, project_dir
             )
+            await _post_orca_status_hook(
+                current_session_id, "SessionBusy", {"sessionID": current_session_id}
+            )
 
             # Race the prompt against opencode's own permission-event stream
             # instead of just awaiting it: nobody is watching this session
@@ -692,7 +972,9 @@ async def run_opencode(
 
             if send_task not in done:
                 _pending_calls[current_session_id] = send_task
-                return _permission_required_result(current_session_id, permission_task.result())
+                permission_request = permission_task.result()
+                await _post_orca_status_hook(current_session_id, "PermissionRequest", permission_request)
+                return _permission_required_result(current_session_id, permission_request)
 
             permission_task.cancel()
             result = await send_task
@@ -704,13 +986,23 @@ async def run_opencode(
                 current_session_id,
             )
             if current_session_id is not None:
-                _evict_and_kill_session_backend(current_session_id)
+                await _evict_and_kill_session_backend(current_session_id)
             continue
 
         session_id = current_session_id
         break
 
-    return _finalize_prompt_result(session_id, result)
+    try:
+        return _finalize_prompt_result(session_id, result)
+    finally:
+        # The run is done (success or an application-level error from
+        # OpenCode) -- tell Orca the pane is idle again before tearing down
+        # its sandbox, then do so now rather than leaving it running until
+        # the whole MCP process exits. A future call reusing this
+        # session_id will simply recreate the sandbox; OpenCode's own
+        # session data lives on disk in project_dir, not in the sandbox.
+        await _post_orca_status_hook(session_id, "SessionIdle", {"sessionID": session_id})
+        await _evict_and_kill_session_backend(session_id)
 
 
 async def _answer_permission(
@@ -743,6 +1035,8 @@ async def _answer_permission(
     if send_task is None:
         return {"session_id": session_id, "status": "ok"}
 
+    await _post_orca_status_hook(session_id, "SessionBusy", {"sessionID": session_id})
+
     # The prompt this permission was blocking may hit another "ask" before
     # it finishes -- race it the same way run_opencode() does, so a chain of
     # permission requests stays entirely between Claude and this tool.
@@ -752,11 +1046,17 @@ async def _answer_permission(
     )
 
     if send_task not in done:
-        return _permission_required_result(session_id, permission_task.result())
+        permission_request = permission_task.result()
+        await _post_orca_status_hook(session_id, "PermissionRequest", permission_request)
+        return _permission_required_result(session_id, permission_request)
 
     permission_task.cancel()
     del _pending_calls[session_id]
-    return _finalize_prompt_result(session_id, await send_task)
+    try:
+        return _finalize_prompt_result(session_id, await send_task)
+    finally:
+        await _post_orca_status_hook(session_id, "SessionIdle", {"sessionID": session_id})
+        await _evict_and_kill_session_backend(session_id)
 
 
 @mcp.tool()
