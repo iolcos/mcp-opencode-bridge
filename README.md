@@ -1,4 +1,4 @@
-# mcp-open-code-bridge
+# mcp-opencode-bridge
 
 An [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server that exposes [OpenCode](https://opencode.ai) coding agents as MCP tools, running each one inside an isolated, disposable Docker sandbox.
 
@@ -114,10 +114,10 @@ Register the server with your MCP client, pointing at either front-end. Example 
 ```json
 {
   "mcpServers": {
-    "mcp-open-code-bridge": {
+    "mcp-opencode-bridge": {
       "type": "stdio",
-      "command": "/path/to/mcp-open-code-bridge/.venv/bin/python3",
-      "args": ["/path/to/mcp-open-code-bridge/server/orca.py"],
+      "command": "/path/to/mcp-opencode-bridge/.venv/bin/python3",
+      "args": ["/path/to/mcp-opencode-bridge/server/orca.py"],
       "env": {}
     }
   }
