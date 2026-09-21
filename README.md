@@ -59,15 +59,13 @@ sbx sandbox  ──►  opencode serve            (HTTP + SSE API, one sandbox p
 
 ## Installation
 
-There is no committed dependency manifest (`requirements.txt`/`pyproject.toml`) yet — install the packages directly:
-
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install mcp pyyaml httpx pydantic starlette uvicorn sse_starlette
+pip install -r requirements.txt
 ```
 
-These are the packages the engine imports directly; some (e.g. `httpx`) pull in their own transitive dependencies automatically.
+`requirements.txt` pins the two packages the engine imports directly (`mcp`, `PyYAML`); `mcp` pulls in its own transitive dependencies (`httpx2`, `pydantic`, `starlette`, `uvicorn`, `sse-starlette`, ...) automatically.
 
 ## Configuration
 
