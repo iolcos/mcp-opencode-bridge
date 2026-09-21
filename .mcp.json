@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "orca-bridde": {
+      "type": "stdio",
+      "command": "/Users/pierregarnier/MCP/orca_bridge/.venv/bin/python3",
+      "args": [
+        "/Users/pierregarnier/MCP/orca_bridge/serveur/orca.py"
+      ],
+      "env": {}
+    }
+  }
+}
