@@ -4,9 +4,9 @@ An [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server that e
 
 ## Overview
 
-Each configured OpenCode agent (`implementer`, `reviewer`, `tester`, ...) is discovered from `.md` files with YAML frontmatter and registered as its own MCP tool. When a tool is called, the server:
+Each configured OpenCode agent is discovered from `.md` files with YAML frontmatter and registered as its own MCP tool. When a tool is called, the server:
 
-1. Spins up a dedicated Docker sandbox for the session via the [`sbx`](https://github.com/) (Docker Sandboxes) CLI.
+1. Spins up a dedicated Docker sandbox for the session via the [`sbx`](https://www.docker.com/products/docker-sandboxes/) (Docker Sandboxes) CLI.
 2. Starts `opencode serve` inside that sandbox and waits for it to come up.
 3. Talks to it over HTTP, posting the prompt and racing the response against the sandbox's own SSE `/event` stream so a pending permission request (e.g. "may I run this shell command?") surfaces immediately instead of hanging.
 4. Lets the caller resolve any pending permission via the `answer_permission` tool, then resumes the run.
@@ -14,7 +14,7 @@ Each configured OpenCode agent (`implementer`, `reviewer`, `tester`, ...) is dis
 
 The sandboxing/session engine is shared code, and there are two thin front-ends on top of it:
 
-- **`server/orca.py`** — integrates with [Orca](https://github.com/): opens a visible terminal pane per session (`orca terminal create` + `opencode attach`) so a human can watch/join live, and forwards busy/waiting/idle status to Orca's local hook HTTP server.
+- **`server/orca.py`** — integrates with [Orca](https://github.com/stablyai/orca): opens a visible terminal pane per session (`orca terminal create` + `opencode attach`) so a human can watch/join live, and forwards busy/waiting/idle status to Orca's local hook HTTP server.
 - **`server/generic.py`** — the same engine with no integration wired in, for use without Orca.
 
 ## Architecture
@@ -76,16 +76,16 @@ Agents are discovered from `.md` files with YAML frontmatter, read from:
 - `~/.config/opencode/agent/*.md` — global agents
 - `<project_dir>/.opencode/agent/*.md` — project-local agents (override global ones with the same name)
 
-Each file's name (minus `.md`) becomes the MCP tool name. Example (`implementer.md`):
+Each file's name (minus `.md`) becomes the MCP tool name. Example (`reviewer.md`):
 
 ```yaml
 ---
-description: Implements an approved technical plan
+description: Reviews an implementation against an approved plan
 mode: primary
 model: opencode/big-pickle
 permission:
   read: allow
-  edit: allow
+  edit: deny
   bash: deny
   external_directory: deny
 network: balanced
@@ -128,7 +128,7 @@ Use `server/generic.py` instead of `server/orca.py` if you don't want the Orca i
 
 ## Available MCP tools
 
-- One tool per discovered agent (e.g. `implementer`, `reviewer`, `tester`), named after the agent's `.md` file stem — invokes that agent's prompt in a fresh sandbox session.
+- One tool per discovered agent, named after the agent's `.md` file stem — invokes that agent's prompt in a fresh sandbox session.
 - `answer_permission` — resolves a pending permission request (`once` / `always` / `reject`) raised during a run, then resumes it.
 
 ## Testing
