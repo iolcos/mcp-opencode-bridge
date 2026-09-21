@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from serveur import orca
+from server import orca
 
 
 class FakeResponse:
@@ -207,7 +207,7 @@ class OrcaStatusHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_op_without_pane_identity(self):
         status_hook = orca.OrcaStatusHook(orca.OrcaVisibilityHook())
 
-        with patch("serveur.orca.httpx2.AsyncClient") as mock_client_cls:
+        with patch("server.orca.httpx2.AsyncClient") as mock_client_cls:
             await status_hook.post_status("ses_1", "SessionBusy", {"sessionID": "ses_1"})
 
         mock_client_cls.assert_not_called()
@@ -215,8 +215,8 @@ class OrcaStatusHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_op_without_hook_coords(self):
         status_hook = self._hook_with_identity("ses_1", "pane_1", "tab_1")
 
-        with patch("serveur.orca._read_orca_hook_endpoint", return_value=None), \
-             patch("serveur.orca.httpx2.AsyncClient") as mock_client_cls:
+        with patch("server.orca._read_orca_hook_endpoint", return_value=None), \
+             patch("server.orca.httpx2.AsyncClient") as mock_client_cls:
             await status_hook.post_status("ses_1", "SessionBusy", {"sessionID": "ses_1"})
 
         mock_client_cls.assert_not_called()
@@ -226,11 +226,11 @@ class OrcaStatusHookTests(unittest.IsolatedAsyncioTestCase):
         mock_client = make_mock_client(FakeResponse(json_data={}))
 
         with patch(
-            "serveur.orca._read_orca_hook_endpoint", return_value=("9999", "tok_abc", "prod", "1.0.0")
+            "server.orca._read_orca_hook_endpoint", return_value=("9999", "tok_abc", "prod", "1.0.0")
         ), patch.dict(
             os.environ,
             {"ORCA_AGENT_LAUNCH_TOKEN": "launch_tok", "ORCA_WORKTREE_ID": "wt_1"},
-        ), patch("serveur.orca.httpx2.AsyncClient", return_value=mock_client):
+        ), patch("server.orca.httpx2.AsyncClient", return_value=mock_client):
             await status_hook.post_status(
                 "ses_1", "PermissionRequest", {"sessionID": "ses_1", "id": "perm_1"}
             )
@@ -257,8 +257,8 @@ class OrcaStatusHookTests(unittest.IsolatedAsyncioTestCase):
         status_hook = self._hook_with_identity("ses_1", "pane_1", "tab_1")
 
         with patch(
-            "serveur.orca._read_orca_hook_endpoint", return_value=("9999", "tok_abc", "", "")
-        ), patch("serveur.orca.httpx2.AsyncClient", side_effect=RuntimeError("boom")):
+            "server.orca._read_orca_hook_endpoint", return_value=("9999", "tok_abc", "", "")
+        ), patch("server.orca.httpx2.AsyncClient", side_effect=RuntimeError("boom")):
             await status_hook.post_status("ses_1", "SessionIdle", {})  # must not raise
 
 

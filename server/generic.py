@@ -1,6 +1,6 @@
 """
 Generic MCP server: the same OpenCode sandboxing trunk (core/package.py) as
-serveur/orca.py, with no integration plugged in -- no visible pane, no
+server/orca.py, with no integration plugged in -- no visible pane, no
 status reporting anywhere. Use this outside of Orca.
 """
 

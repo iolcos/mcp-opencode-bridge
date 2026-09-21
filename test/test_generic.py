@@ -5,11 +5,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core import package
-from serveur import generic
+from server import generic
 
 
 class DefaultHooksAreNoOpsTests(unittest.IsolatedAsyncioTestCase):
-    """serveur/generic.py wires no integration in at all, relying entirely on
+    """server/generic.py wires no integration in at all, relying entirely on
     the trunk's own default VisibilityHook/StatusHook behaving as working
     no-ops."""
 

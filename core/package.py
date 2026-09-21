@@ -7,8 +7,8 @@ Sandboxes) sandbox per session, speaks its HTTP/SSE API, and tracks the
 session <-> sandbox binding. Anything an integration needs to plug in --
 giving the user a way to see the session live, or reporting busy/idle/waiting
 status somewhere -- goes through the VisibilityHook/StatusHook interfaces
-below, implemented per integration (see serveur/orca.py for the Orca one,
-serveur/generic.py for the no-op one).
+below, implemented per integration (see server/orca.py for the Orca one,
+server/generic.py for the no-op one).
 """
 
 import asyncio

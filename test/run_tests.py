@@ -1,7 +1,7 @@
 """
 Runs the whole test suite: one module per server implementation, plus the
 shared trunk. Add a future integration's test module to TEST_MODULES when it
-joins serveur/orca.py and serveur/generic.py.
+joins server/orca.py and server/generic.py.
 """
 
 import sys
@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 TEST_MODULES = ["test_package", "test_orca", "test_generic"]
 # Add here the future test_<nouvelle_intégration>.py the day a new
-# integration (another "front" than Orca) joins serveur/orca.py and
-# serveur/generic.py.
+# integration (another "front" than Orca) joins server/orca.py and
+# server/generic.py.
 
 
 def load_tests() -> unittest.TestSuite:
